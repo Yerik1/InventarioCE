@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <dimen name="p_screen">20dp</dimen>
+    <dimen name="p_block">14dp</dimen>
+    <dimen name="gap_items">12dp</dimen>
+</resources>
