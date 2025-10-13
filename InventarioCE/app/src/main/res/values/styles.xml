@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <style name="Theme.NfcApp" parent="Theme.Material3.DayNight.NoActionBar" />
+
+    <!-- Textos -->
+    <style name="TextTitle">
+        <item name="android:textSize">20sp</item>
+        <item name="android:textStyle">bold</item>
+    </style>
+
+    <style name="TextBody">
+        <item name="android:textSize">15sp</item>
+    </style>
+
+    <style name="TextMono">
+        <item name="android:typeface">monospace</item>
+        <item name="android:textSize">14sp</item>
+    </style>
+
+    <!-- Botones -->
+    <style name="BtnFilled" parent="Widget.Material3.Button">
+        <item name="android:layout_margin">4dp</item>
+    </style>
+
+    <style name="BtnOutlined" parent="Widget.Material3.Button.OutlinedButton">
+        <item name="android:layout_margin">4dp</item>
+    </style>
+
+    <style name="BtnTonal" parent="Widget.Material3.Button.TonalButton">
+        <item name="android:layout_margin">4dp</item>
+    </style>
+
+</resources>
