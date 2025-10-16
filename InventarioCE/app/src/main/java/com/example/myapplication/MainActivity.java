@@ -14,44 +14,102 @@ import android.widget.EditText;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import java.nio.charset.StandardCharsets;
 import java.util.concurrent.Executors;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-
 
 public class MainActivity extends AppCompatActivity implements NfcAdapter.ReaderCallback {
 
+    /**
+     * Representa el modo actual de la pantalla:
+     *  - IDLE: sin operación activa
+     *  - READ_ARMED: esperando un tag para leer
+     *  - EDIT_ON_DETECT: esperando un tag para editar/escribir
+     */
     private enum Mode { IDLE, READ_ARMED, EDIT_ON_DETECT }
 
+    // --------------------------------------------------------------------------------------------
+    // Atributos (Campos/Propiedades)
+    // --------------------------------------------------------------------------------------------
+
+    /** Adaptador del sistema para interactuar con el hardware NFC (activar modo lector, etc.) */
     private NfcAdapter nfcAdapter;
-    private TextView tvEstado, tvSalida;
-    private Button btnLeer, btnEscribir;
 
+    /** Texto en UI para mostrar el estado general (instrucciones/errores/progreso). */
+    private TextView tvEstado;
+
+    /** Texto en UI para mostrar el resultado principal (por ejemplo el número leído o info del tag). */
+    private TextView tvSalida;
+
+    /** Botón para iniciar el flujo de lectura. */
+    private Button btnLeer;
+
+    /** Botón para iniciar el flujo de escritura/edición. */
+    private Button btnEscribir;
+
+    /** Modo operativo actual de la Activity (idle, leer, editar). */
     private volatile Mode mode = Mode.IDLE;
-    private volatile String lastReadValue = null; // para prellenar
-    private volatile Tag pendingEditTag = null;   // tag detectado al que se escribirá
 
+    /** Último valor leído desde el tag, usado para prellenar el diálogo de edición. */
+    private volatile String lastReadValue = null;
+
+    /** Último tag detectado pendiente de escritura en modo EDIT_ON_DETECT. */
+    private volatile Tag pendingEditTag = null;
+
+    /** Bandera para detectar si la app corre en emulador y habilitar comportamientos simulados. */
     private boolean isEmulator;
 
+    /** Momento (ms) del último write exitoso; se usa para filtrar lecturas/escrituras duplicadas seguidas. */
+    private volatile long lastWriteMs = 0;
+
+    /** Ventana de tiempo (ms) para ignorar múltiples callbacks consecutivos tras una escritura. */
+    private static final long SQUELCH_MS = 1500;
+
+    // --------------------------------------------------------------------------------------------
+    // Interfaz interna para la confirmación del diálogo
+    // --------------------------------------------------------------------------------------------
+    /**
+     * Descripción: Contrato para recibir el valor confirmado desde el diálogo de edición.
+     */
+    private interface ConfirmCallback { void onConfirm(String value); }
+
+    // --------------------------------------------------------------------------------------------
+    // Utilitario: Toast corto
+    // --------------------------------------------------------------------------------------------
+    /**
+     * Entradas: s (String) - mensaje a mostrar.
+     * Salidas: Ninguna.
+     * Descripción: Muestra un Toast corto con el texto proporcionado.
+     */
+    private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_SHORT).show(); }
+
+    // --------------------------------------------------------------------------------------------
+    // Ciclo de vida: onCreate
+    // --------------------------------------------------------------------------------------------
+    /**
+     * Entradas: savedInstanceState (Bundle) - estado previo si la Activity fue recreada.
+     * Salidas: Ninguna (efecto sobre la UI y estado interno).
+     * Descripción: Inicializa la UI, detecta capacidades NFC, configura listeners de botones y
+     *              establece el modo inicial de la pantalla.
+     */
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        setContentView(R.layout.activity_main);
 
+        // [Sección] Inflado de layout y referencias a vistas
+        setContentView(R.layout.activity_main);
         tvEstado  = findViewById(R.id.tvEstado);
         tvSalida  = findViewById(R.id.tvSalida);
         btnLeer   = findViewById(R.id.btnLeer);
         btnEscribir = findViewById(R.id.btnEscribir);
 
+        // [Sección] Detección de entorno (emulador vs dispositivo real)
         isEmulator =
                 android.os.Build.FINGERPRINT.contains("generic")
                         || android.os.Build.FINGERPRINT.startsWith("unknown")
                         || android.os.Build.MODEL.contains("Emulator")
                         || android.os.Build.MODEL.contains("Android SDK built for x86");
 
+        // [Sección] Inicialización de NFC y mensaje de estado
         nfcAdapter = NfcAdapter.getDefaultAdapter(this);
-
         if (nfcAdapter == null) {
             tvEstado.setText(isEmulator
                     ? "Modo emulador: no hay NFC (UI de demo activa)."
@@ -62,26 +120,27 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
             tvEstado.setText("Elige Leer o Escribir.");
         }
 
-        // === LEER: arma lectura y muestra el valor leído ===
+        // [Sección] Listener botón 'Leer': prepara el modo lectura o simula en emulador
         btnLeer.setOnClickListener(v -> {
             tvSalida.setText("");
             if (nfcAdapter == null || isEmulator) {
-                // Simulación
+                // Modo simulado: no hay NFC real
                 lastReadValue = "12345678";
                 tvSalida.setText("Leído (simulado): " + lastReadValue);
                 tvEstado.setText("Lectura simulada.");
                 mode = Mode.IDLE;
             } else {
+                // Armar modo lectura para reaccionar al próximo tag
                 mode = Mode.READ_ARMED;
                 tvEstado.setText("Modo LECTURA armado: acerca el tag para leer.");
             }
         });
 
-        // === ESCRIBIR: detectar tag -> abrir diálogo con valor actual -> grabar ===
+        // [Sección] Listener botón 'Escribir': prepara el modo edición o simula en emulador
         btnEscribir.setOnClickListener(v -> {
             tvSalida.setText("");
             if (nfcAdapter == null || isEmulator) {
-                // Simulación completa: "detecta" y edita/graba sin NFC
+                // Modo simulado: abrir diálogo y "guardar"
                 String prefill = (lastReadValue == null) ? "" : lastReadValue;
                 showEditDialog(prefill, value -> {
                     lastReadValue = value;
@@ -89,65 +148,116 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                     tvEstado.setText("Escritura simulada.");
                 });
             } else {
+                // Armar modo edición: la app pedirá tag y luego abrirá diálogo
                 mode = Mode.EDIT_ON_DETECT;
                 tvEstado.setText("Acerca el tag para EDITAR su contenido.");
             }
         });
     }
 
-
+    // --------------------------------------------------------------------------------------------
+    // Ciclo de vida: onResume
+    // --------------------------------------------------------------------------------------------
+    /**
+     * Entradas: Ninguna.
+     * Salidas: Ninguna (efecto en sistema NFC).
+     * Descripción: Habilita el modo lector NFC cuando la Activity pasa a primer plano.
+     */
     @Override
     protected void onResume() {
         super.onResume();
+        // [Sección] Reobtención del adaptador (defensivo)
         nfcAdapter = NfcAdapter.getDefaultAdapter(this);
+
+        // [Sección] Habilitar modo lector si hay NFC
         if (nfcAdapter != null) {
             int flags =  NfcAdapter.FLAG_READER_NFC_A
                     | NfcAdapter.FLAG_READER_NFC_B
                     | NfcAdapter.FLAG_READER_NFC_F
                     | NfcAdapter.FLAG_READER_NFC_V
-                    | NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK   // <-- evita que Android abra apps externas
-                    | NfcAdapter.FLAG_READER_NO_PLATFORM_SOUNDS; // opcional
+                    | NfcAdapter.FLAG_READER_SKIP_NDEF_CHECK
+                    | NfcAdapter.FLAG_READER_NO_PLATFORM_SOUNDS;
             nfcAdapter.enableReaderMode(this, this, flags, null);
         }
     }
 
+    // --------------------------------------------------------------------------------------------
+    // Ciclo de vida: onPause
+    // --------------------------------------------------------------------------------------------
+    /**
+     * Entradas: Ninguna.
+     * Salidas: Ninguna (efecto en sistema NFC).
+     * Descripción: Deshabilita el modo lector NFC cuando la Activity sale de primer plano.
+     */
     @Override
     protected void onPause() {
         super.onPause();
+        // [Sección] Deshabilitar modo lector para ahorrar energía y evitar callbacks en background
         if (nfcAdapter != null) {
             nfcAdapter.disableReaderMode(this);
         }
     }
 
+    // --------------------------------------------------------------------------------------------
+    // Utilitario de UI seguro
+    // --------------------------------------------------------------------------------------------
+    /**
+     * Entradas: r (Runnable) - acción que se ejecutará en el hilo de UI.
+     * Salidas: Ninguna.
+     * Descripción: Ejecuta de forma segura un Runnable en el hilo principal evitando correr
+     *              cuando la Activity ya no es válida (finishing/destroyed).
+     */
     private void safeRunOnUi(Runnable r) {
+        // [Sección] Cortocircuito si la Activity está finalizando o destruida
         if (isFinishing() || (android.os.Build.VERSION.SDK_INT >= 17 && isDestroyed())) return;
+
+        // [Sección] Cambio de hilo a UI con verificación redundante
         runOnUiThread(() -> {
             if (isFinishing() || (android.os.Build.VERSION.SDK_INT >= 17 && isDestroyed())) return;
             r.run();
         });
     }
 
-    private volatile long lastWriteMs = 0;
-    private static final long SQUELCH_MS = 1500;
-    // ==== NFC callback (solo dispositivo real) ====
+    // --------------------------------------------------------------------------------------------
+    // Callback NFC: onTagDiscovered
+    // --------------------------------------------------------------------------------------------
+    /**
+     * Entradas: tag (Tag) - objeto del sistema que representa el tag NFC detectado.
+     * Salidas: Ninguna (actualiza UI y ejecuta flujos de lectura/escritura).
+     * Descripción: Punto de entrada cuando el dispositivo detecta un tag. Según el modo:
+     *   - READ_ARMED: lee campo numérico del sector 1 y lo muestra.
+     *   - EDIT_ON_DETECT: detecta el campo numérico, abre diálogo para editar y escribe reemplazo.
+     *   - IDLE: muestra recordatorio de seleccionar una acción.
+     */
     @Override
     public void onTagDiscovered(Tag tag) {
         long now = System.currentTimeMillis();
-        if (now - lastWriteMs < SQUELCH_MS) return;  // ignora relecturas inmediatas
+
+        // [Sección] Anti-rebote: ignorar callbacks muy seguidos tras una escritura
+        if (now - lastWriteMs < SQUELCH_MS) return;
+
         switch (mode) {
+
+            // ------------------------------------------------------------------------------------
+            // Modo de lectura
+            // ------------------------------------------------------------------------------------
             case READ_ARMED: {
                 Executors.newSingleThreadExecutor().execute(() -> {
-                    // Solo MifareClassic sector 1 → número
+                    // [Sección] Solo soportamos lectura MifareClassic (si no, mostramos aviso)
                     if (MifareClassic.get(tag) != null) {
-                        String numero = readOnlyNumberFromSector(tag, /*sector*/1, KEY_DEFAULT);
+
+                        // [Sección] Leer SOLO el número (primer grupo de dígitos >= 3) del sector
+                        String numero = MifareClassicHelper.readOnlyNumberFromSector(tag, /*sector*/1, MifareClassicHelper.KEY_DEFAULT);
+
+                        // [Sección] Reflejar resultado en la UI
                         safeRunOnUi(() -> {
                             if (numero == null || numero.isEmpty()) {
-                                tvSalida.setText("");  // no mostrar dump
+                                tvSalida.setText("");
                                 tvEstado.setText("No se encontró número en el sector 1.");
                                 lastReadValue = null;
                             } else {
                                 lastReadValue = numero;
-                                tvSalida.setText(numero);           // <-- SOLO el 97175
+                                tvSalida.setText(numero);  // Se muestra solo el número
                                 tvEstado.setText("Lectura OK.");
                             }
                             mode = Mode.IDLE;
@@ -155,7 +265,7 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                         return;
                     }
 
-                    // Si no es Classic, podrías conservar tu lectura NDEF/Ultralight
+                    // [Sección] Tag no compatible con MifareClassic
                     safeRunOnUi(() -> {
                         tvSalida.setText("");
                         tvEstado.setText("Tag no MifareClassic.");
@@ -165,15 +275,22 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                 break;
             }
 
+            // ------------------------------------------------------------------------------------
+            // Modo de edición/escritura
+            // ------------------------------------------------------------------------------------
             case EDIT_ON_DETECT: {
+                // [Sección] Guardar tag detectado y mostrar techs informativas
                 pendingEditTag = tag;
-                String techInfo = techsString(tag);
+                String techInfo = MifareClassicHelper.techsString(tag);
                 safeRunOnUi(() -> tvSalida.setText(techInfo));
 
+                // [Sección] Verificar compatibilidad MifareClassic
                 if (MifareClassic.get(tag) != null) {
-                    // Detect field (buscar números) en sector 1
+                    // [Sección] Localizar el campo numérico en sector 1 y luego pedir nuevo valor
                     Executors.newSingleThreadExecutor().execute(() -> {
-                        FieldDetect fd = detectFieldInSector(tag, /*sectorIndex*/1, "\\d{3,}", KEY_DEFAULT);
+                        FieldDetect fd = MifareClassicHelper.detectFieldInSector(tag, /*sectorIndex*/1, "\\d{3,}", MifareClassicHelper.KEY_DEFAULT);
+
+                        // [Sección] No se pudo autenticar o no existe campo numérico
                         if (fd == null) {
                             safeRunOnUi(() -> {
                                 tvEstado.setText("No se encontró campo numérico en sector 1 (o no se pudo autenticar).");
@@ -183,13 +300,16 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                             return;
                         }
 
-                        // Mostrar valor detectado en UI y abrir diálogo para editar
+                        // [Sección] Abrir diálogo con valor actual, confirmar y escribir
                         safeRunOnUi(() -> {
                             tvEstado.setText("Valor detectado: " + fd.value + ". Edita y confirma para sobrescribir.");
                             showEditDialog(fd.value, newValue -> {
-                                // onConfirm: escribir
                                 Executors.newSingleThreadExecutor().execute(() -> {
-                                    WriteOutcome out = replaceFieldInSector(pendingEditTag, fd, newValue, KEY_DEFAULT);
+
+                                    // [Sección] Intento de reemplazo del campo y verificación posterior
+                                    WriteOutcome out = MifareClassicHelper.replaceFieldInSector(pendingEditTag, fd, newValue, MifareClassicHelper.KEY_DEFAULT);
+
+                                    // [Sección] Resultado a UI + housekeeping
                                     safeRunOnUi(() -> {
                                         tvEstado.setText(out.userMessage);
                                         if (out.ok) {
@@ -209,272 +329,54 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                 }
             }
 
+            // ------------------------------------------------------------------------------------
+            // Sin modo seleccionado
+            // ------------------------------------------------------------------------------------
             case IDLE:
             default:
                 runOnUiThread(() -> toast("Elige Leer o Escribir primero."));
         }
     }
 
-    static class FieldDetect {
-        final String value;        // valor ASCII detectado (ej "97175")
-        final int sectorIndex;     // sector donde se halló (ej 1)
-        final int byteStart;       // start byte offset dentro de la zona de datos del sector (0..dataBytes-1)
-        final int byteLength;      // longitud en bytes del match
-        FieldDetect(String value, int sectorIndex, int byteStart, int byteLength) {
-            this.value = value; this.sectorIndex = sectorIndex; this.byteStart = byteStart; this.byteLength = byteLength;
-        }
-    }
-
-    private FieldDetect detectFieldInSector(Tag tag, int sectorIndex, String regex, byte[] key) {
-        MifareClassic mc = MifareClassic.get(tag);
-        if (mc == null) return null;
-        try {
-            mc.connect();
-            boolean auth = mc.authenticateSectorWithKeyA(sectorIndex, key);
-            if (!auth) auth = mc.authenticateSectorWithKeyB(sectorIndex, key);
-            if (!auth) return null;
-
-            int firstBlock = mc.sectorToBlock(sectorIndex);
-            int dataBlocks = mc.getBlockCountInSector(sectorIndex) - 1; // exclude trailer
-            int totalBytes = dataBlocks * MifareClassic.BLOCK_SIZE;
-            byte[] all = new byte[totalBytes];
-            int p = 0;
-            for (int i = 0; i < dataBlocks; i++) {
-                byte[] b = mc.readBlock(firstBlock + i);
-                System.arraycopy(b, 0, all, p, b.length);
-                p += b.length;
-            }
-            String ascii = new String(all, StandardCharsets.UTF_8);
-            // For searching, convert non-printables to dots so regex won't match them; but we want raw ascii bytes for positions.
-            // We'll search on ASCII printable representation to find visible digits.
-            String printable = toAsciiPrintable(all);
-            Pattern pat = Pattern.compile(regex);
-            Matcher m = pat.matcher(printable);
-            if (m.find()) {
-                int startPrintable = m.start();
-                int length = m.end() - m.start();
-                // Map printable index back to byte index: because toAsciiPrintable replaced non-printables with '.' but kept length same,
-                // indices correspond to byte offsets.
-                return new FieldDetect(m.group(), sectorIndex, startPrintable, length);
-            } else {
-                return null;
-            }
-        } catch (Exception e) {
-            android.util.Log.w("MIFARE_DETECT", e);
-            return null;
-        } finally {
-            try { mc.close(); } catch (Exception ignored) {}
-        }
-    }
-
-    private WriteOutcome replaceFieldInSector(Tag tag, FieldDetect field, String newValue, byte[] key) {
-        if (tag == null || field == null) return WriteOutcome.fail("Parámetros inválidos.", "null input");
-
-        MifareClassic mc = MifareClassic.get(tag);
-        if (mc == null) return WriteOutcome.fail("Tag no soporta MifareClassic.", "mc==null");
-
-        byte[] newBytes = (newValue == null) ? new byte[0] : newValue.getBytes(java.nio.charset.StandardCharsets.UTF_8);
-
-        try {
-            mc.connect();
-            boolean auth = mc.authenticateSectorWithKeyA(field.sectorIndex, key);
-            if (!auth) auth = mc.authenticateSectorWithKeyB(field.sectorIndex, key);
-            if (!auth) return WriteOutcome.fail("No se pudo autenticar sector para escribir.", "auth failed sector=" + field.sectorIndex);
-
-            int firstBlock = mc.sectorToBlock(field.sectorIndex);
-            int dataBlocks = mc.getBlockCountInSector(field.sectorIndex) - 1; // excluye trailer
-            int totalBytes = dataBlocks * MifareClassic.BLOCK_SIZE;
-
-            // Leer TODOS los bytes de datos del sector
-            byte[] all = new byte[totalBytes];
-            int p = 0;
-            for (int i = 0; i < dataBlocks; i++) {
-                byte[] b = mc.readBlock(firstBlock + i);
-                System.arraycopy(b, 0, all, p, b.length);
-                p += b.length;
-            }
-
-            // Calcular el span máximo disponible a partir de byteStart
-            int start = field.byteStart;
-            if (start < 0 || start >= all.length) {
-                return WriteOutcome.fail("Posición de inicio fuera de rango.", "start=" + start + " total=" + all.length);
-            }
-            int maxSpan = computeNumericFieldSpan(all, start);
-            if (maxSpan <= 0) {
-                return WriteOutcome.fail("No hay espacio contiguo disponible para expandir el campo.", "maxSpan<=0");
-            }
-
-            // Construir reemplazo con truncado/padding según maxSpan
-            int cap = Math.min(maxSpan, all.length - start);
-            byte[] replacement = new byte[cap];
-            java.util.Arrays.fill(replacement, (byte)0x20); // padding con espacios
-            int copyLen = Math.min(cap, newBytes.length);
-            System.arraycopy(newBytes, 0, replacement, 0, copyLen);
-
-            // Escribir en el buffer 'all'
-            System.arraycopy(replacement, 0, all, start, cap);
-
-            // Volcar de regreso bloque por bloque (solo data blocks)
-            for (int i = 0; i < dataBlocks; i++) {
-                int blockIndex = firstBlock + i;
-                byte[] blockData = new byte[MifareClassic.BLOCK_SIZE];
-                System.arraycopy(all, i * MifareClassic.BLOCK_SIZE, blockData, 0, MifareClassic.BLOCK_SIZE);
-                mc.writeBlock(blockIndex, blockData);
-            }
-
-            // Verificar la región escrita
-            byte[] back = new byte[totalBytes];
-            p = 0;
-            for (int i = 0; i < dataBlocks; i++) {
-                byte[] b = mc.readBlock(firstBlock + i);
-                System.arraycopy(b, 0, back, p, b.length);
-                p += b.length;
-            }
-            for (int i = 0; i < cap; i++) {
-                if (back[start + i] != replacement[i]) {
-                    return WriteOutcome.fail("Verificación falló (bytes distintos tras escribir).", "verify mismatch at +" + i);
-                }
-            }
-
-            String note = (newBytes.length > cap)
-                    ? " (truncado a " + cap + " bytes disponibles)"
-                    : "";
-            return WriteOutcome.ok("Campo actualizado a '" + newValue + "'" + note);
-
-        } catch (java.io.IOException e) {
-            return WriteOutcome.fail("Error E/S durante la escritura. Mantén el tag quieto.", "IOException: " + e.getMessage());
-        } catch (Exception e) {
-            return WriteOutcome.fail("Fallo inesperado al escribir.", "Exception: " + e.getMessage());
-        } finally {
-            try { mc.close(); } catch (Exception ignored) {}
-        }
-    }
-
-    private int computeNumericFieldSpan(byte[] all, int start) {
-        int i = start;
-        while (i < all.length) {
-            int v = all[i] & 0xFF;
-            boolean isDigit = (v >= 0x30 && v <= 0x39);
-            boolean isPad   = (v == 0x20 || v == 0x00);
-            if (isDigit || isPad) {
-                i++;
-            } else {
-                break;
-            }
-        }
-        return i - start;
-    }
-
-    /** Lee los bloques de datos del sector dado (excluye trailer) y devuelve SOLO el primer grupo de dígitos (>=3). */
-    private String readOnlyNumberFromSector(Tag tag, int sectorIndex, byte[] key) {
-        MifareClassic mc = MifareClassic.get(tag);
-        if (mc == null) return null;
-        try {
-            mc.connect();
-            boolean auth = mc.authenticateSectorWithKeyA(sectorIndex, key);
-            if (!auth) auth = mc.authenticateSectorWithKeyB(sectorIndex, key);
-            if (!auth) return null;
-
-            int firstBlock = mc.sectorToBlock(sectorIndex);
-            int dataBlocks = mc.getBlockCountInSector(sectorIndex) - 1; // último es trailer
-            int totalBytes = dataBlocks * MifareClassic.BLOCK_SIZE;
-
-            byte[] all = new byte[totalBytes];
-            int p = 0;
-            for (int i = 0; i < dataBlocks; i++) {
-                byte[] b = mc.readBlock(firstBlock + i);
-                System.arraycopy(b, 0, all, p, b.length);
-                p += b.length;
-            }
-
-            // Convertimos a “ASCII imprimible” para que el índice case 1:1 con bytes
-            String ascii = toAsciiPrintable(all);
-            Matcher m = Pattern.compile("\\d{3,}").matcher(ascii);
-            return m.find() ? m.group() : null;
-
-        } catch (Exception e) {
-            android.util.Log.w("MIFARE_READ_NUM", e);
-            return null;
-        } finally {
-            try { mc.close(); } catch (Exception ignored) {}
-        }
-    }
-
-
-    // ---------- Utils -----
-    private String toAsciiPrintable(byte[] b) {
-        if (b == null) return "";
-        StringBuilder sb = new StringBuilder(b.length);
-        for (byte x : b) {
-            int v = x & 0xFF;
-            // imprimibles básicos
-            if (v >= 32 && v <= 126) sb.append((char) v);
-            else sb.append('.'); // marca no-imprimibles
-        }
-        // opcional: recorta puntos finales para ver dónde termina el texto real
-        int end = sb.length();
-        while (end > 0 && sb.charAt(end - 1) == '.') end--;
-        return sb.substring(0, end);
-    }
-
-
-    // Resultado tipado
-    static class WriteOutcome {
-        final boolean ok;
-        final String userMessage;
-        final String technicalDetail;
-        WriteOutcome(boolean ok, String userMessage, String technicalDetail) {
-            this.ok = ok; this.userMessage = userMessage; this.technicalDetail = technicalDetail;
-        }
-        static WriteOutcome ok(String msg) { return new WriteOutcome(true, msg, ""); }
-        static WriteOutcome fail(String userMsg, String tech) { return new WriteOutcome(false, userMsg, tech); }
-    }
-
-    private String techsString(Tag tag) {
-        if (tag == null) return "(sin tag)";
-        String[] techs = tag.getTechList(); // e.g. ["android.nfc.tech.NfcA", "android.nfc.tech.MifareClassic"]
-        StringBuilder sb = new StringBuilder("Techs: ");
-        for (int i = 0; i < techs.length; i++) {
-            String t = techs[i];
-            int lastDot = t.lastIndexOf('.');
-            sb.append(lastDot >= 0 ? t.substring(lastDot + 1) : t);
-            if (i < techs.length - 1) sb.append(", ");
-        }
-        return sb.toString();
-    }
-
-    // ===== Diálogo de edición =====
-    private interface ConfirmCallback { void onConfirm(String value); }
-
+    // --------------------------------------------------------------------------------------------
+    // Diálogo de edición (UI)
+    // --------------------------------------------------------------------------------------------
+    /**
+     * Entradas:
+     *   - prefill (String): valor inicial que aparecerá en el campo de texto (puede ser vacío).
+     *   - cb (ConfirmCallback): callback a invocar con el nuevo valor confirmado por el usuario.
+     * Salidas: Ninguna directa (el resultado se entrega vía callback).
+     * Descripción: Muestra un diálogo con un EditText numérico para que el usuario modifique el
+     *              valor y lo confirme. Valida que no sea vacío antes de confirmar.
+     */
     private void showEditDialog(String prefill, ConfirmCallback cb) {
+        // [Sección] Crear campo de entrada configurado para números
         final EditText input = new EditText(this);
         input.setHint("Número (ej. 88887777)");
         input.setInputType(InputType.TYPE_CLASS_NUMBER);
         input.setFilters(new InputFilter[]{ new InputFilter.LengthFilter(32) });
         if (prefill != null) input.setText(prefill);
 
+        // [Sección] Construir y mostrar el AlertDialog con acciones
         new AlertDialog.Builder(this)
                 .setTitle("Editar número del tag")
                 .setView(input)
                 .setPositiveButton("Guardar", (d, w) -> {
+                    // [Sección] Validación simple
                     String val = input.getText().toString().trim();
                     if (val.isEmpty()) {
                         toast("Ingresa un número.");
                         return;
                     }
+                    // [Sección] Devolver resultado por callback
                     cb.onConfirm(val);
                 })
                 .setNegativeButton("Cancelar", (d, w) -> {
+                    // [Sección] Limpiar estado y volver a IDLE
                     tvEstado.setText("Operación cancelada.");
-                    // Si estábamos esperando escribir sobre un tag detectado:
                     pendingEditTag = null;
                     mode = Mode.IDLE;
                 })
                 .show();
     }
-    private static final byte[] KEY_DEFAULT = new byte[]{
-            (byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF,(byte)0xFF
-    };
-
-    private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_SHORT).show(); }
 }
