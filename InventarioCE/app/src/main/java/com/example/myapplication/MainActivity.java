@@ -247,7 +247,7 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                     if (MifareClassic.get(tag) != null) {
 
                         // [Sección] Leer SOLO el número (primer grupo de dígitos >= 3) del sector
-                        String numero = MifareClassicHelper.readOnlyNumberFromSector(tag, /*sector*/1, MifareClassicHelper.KEY_DEFAULT);
+                        String numero = MifareClassicHelper.readConcatNumericFromSector(tag, /*sector*/1, MifareClassicHelper.KEY_DEFAULT,/*min*/ 12);
 
                         // [Sección] Reflejar resultado en la UI
                         safeRunOnUi(() -> {
@@ -288,7 +288,7 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                 if (MifareClassic.get(tag) != null) {
                     // [Sección] Localizar el campo numérico en sector 1 y luego pedir nuevo valor
                     Executors.newSingleThreadExecutor().execute(() -> {
-                        FieldDetect fd = MifareClassicHelper.detectFieldInSector(tag, /*sectorIndex*/1, "\\d{3,}", MifareClassicHelper.KEY_DEFAULT);
+                        FieldDetect fd = MifareClassicHelper.detectFieldInSector(tag, /*sectorIndex*/1, "\\d+", MifareClassicHelper.KEY_DEFAULT);
 
                         // [Sección] No se pudo autenticar o no existe campo numérico
                         if (fd == null) {

@@ -60,24 +60,25 @@ class MifareClassicHelper {
      *   Autentica el sector, lee los bloques de datos (excluyendo el trailer), convierte a ASCII
      *   "imprimible" y retorna el primer número con 3 o más dígitos (útil para extraer IDs como 97175).
      */
-    static String readOnlyNumberFromSector(Tag tag, int sectorIndex, byte[] key) {
-        // [Sección] Obtener interfaz MIFARE y validar
+
+    /**
+     * Concatena campos numéricos en orden hasta alcanzar minTotalDigits (p.ej. 6).
+     * Útil cuando tu ID está “partido” entre la primera y segunda entrada.
+     */
+    static String readConcatNumericFromSector(Tag tag, int sectorIndex, byte[] key, int maxDigits) {
         MifareClassic mc = MifareClassic.get(tag);
         if (mc == null) return null;
 
         try {
-            // [Sección] Conexión + autenticación con Key A y fallback a Key B
             mc.connect();
             boolean auth = mc.authenticateSectorWithKeyA(sectorIndex, key);
             if (!auth) auth = mc.authenticateSectorWithKeyB(sectorIndex, key);
             if (!auth) return null;
 
-            // [Sección] Calcular rango de bloques de datos del sector (excluye trailer)
             int firstBlock = mc.sectorToBlock(sectorIndex);
-            int dataBlocks = mc.getBlockCountInSector(sectorIndex) - 1; // último es trailer
+            int dataBlocks = mc.getBlockCountInSector(sectorIndex) - 1; // sin trailer
             int totalBytes = dataBlocks * MifareClassic.BLOCK_SIZE;
 
-            // [Sección] Leer todos los bloques de datos del sector de forma contigua
             byte[] all = new byte[totalBytes];
             int p = 0;
             for (int i = 0; i < dataBlocks; i++) {
@@ -86,19 +87,33 @@ class MifareClassicHelper {
                 p += b.length;
             }
 
-            // [Sección] Convertir a ASCII imprimible y buscar el primer grupo de dígitos (≥3)
-            String printable = toAsciiPrintable(all);
-            Matcher m = Pattern.compile("\\d{3,}").matcher(printable);
-            return m.find() ? m.group() : null;
+            // Encuentra slots (runs de [0-9, espacio, 0x00]) a lo largo del sector
+            java.util.List<int[]> slots = findWritableSlots(all, 0);
+            if (slots.isEmpty()) return null;
+
+            StringBuilder out = new StringBuilder();
+            outer:
+            for (int[] s : slots) {
+                int start = s[0], len = s[1];
+                for (int i = 0; i < len; i++) {
+                    byte b = all[start + i];
+                    if (b >= '0' && b <= '9') {
+                        out.append((char)b);
+                        if (out.length() >= maxDigits) break outer;
+                    }
+                }
+            }
+
+            return out.length() > 0 ? out.toString() : null;
 
         } catch (Exception e) {
-            android.util.Log.w("MIFARE_READ_NUM", e);
+            android.util.Log.w("MIFARE_READ_CONCAT", e);
             return null;
         } finally {
-            // [Sección] Cierre defensivo
             try { mc.close(); } catch (Exception ignored) {}
         }
     }
+
 
     /**
      * Entradas:
@@ -114,23 +129,38 @@ class MifareClassicHelper {
      *   (excluye trailer). Devuelve la localización del match para luego poder reemplazarlo.
      */
     static FieldDetect detectFieldInSector(Tag tag, int sectorIndex, String regex, byte[] key) {
-        // [Sección] Obtener interfaz MIFARE y validar
         MifareClassic mc = MifareClassic.get(tag);
         if (mc == null) return null;
+
+        // Parseo de límites desde el regex (soporta \d{N}, \d{N,}, \d{N,M}); por defecto min=1, max=12
+        class Bounds { int min; Integer max; Bounds(int min, Integer max){ this.min=min; this.max=max; } }
+        java.util.function.Function<String, Bounds> parseBounds = (String rx) -> {
+            java.util.regex.Matcher mm = java.util.regex.Pattern
+                    .compile("\\\\d\\{\\s*(\\d+)\\s*(?:,\\s*(\\d*)\\s*)?\\}")
+                    .matcher(rx);
+            if (mm.find()) {
+                int min = Integer.parseInt(mm.group(1));
+                Integer max = null;
+                if (mm.group(2) != null && !mm.group(2).isEmpty()) {
+                    max = Integer.valueOf(mm.group(2));
+                }
+                return new Bounds(min, max);
+            }
+            return new Bounds(1, 12); // por defecto
+        };
+
         try {
-            // [Sección] Conexión + autenticación con Key A/B
             mc.connect();
             boolean auth = mc.authenticateSectorWithKeyA(sectorIndex, key);
             if (!auth) auth = mc.authenticateSectorWithKeyB(sectorIndex, key);
             if (!auth) return null;
 
-            // [Sección] Determinar bloques de datos y buffer contiguo
+            // Leer bloques de datos del sector (excluye el trailer)
             int firstBlock = mc.sectorToBlock(sectorIndex);
-            int dataBlocks = mc.getBlockCountInSector(sectorIndex) - 1; // exclude trailer
+            int dataBlocks = mc.getBlockCountInSector(sectorIndex) - 1;
             int totalBytes = dataBlocks * MifareClassic.BLOCK_SIZE;
-            byte[] all = new byte[totalBytes];
 
-            // [Sección] Leer bloques de datos contiguos
+            byte[] all = new byte[totalBytes];
             int p = 0;
             for (int i = 0; i < dataBlocks; i++) {
                 byte[] b = mc.readBlock(firstBlock + i);
@@ -138,24 +168,71 @@ class MifareClassicHelper {
                 p += b.length;
             }
 
-            // [Sección] Buscar regex en la representación ASCII imprimible
-            String printable = toAsciiPrintable(all);
-            Pattern pat = Pattern.compile(regex);
-            Matcher m = pat.matcher(printable);
-            if (m.find()) {
-                int startPrintable = m.start();
-                int length = m.end() - m.start();
-                return new FieldDetect(m.group(), sectorIndex, startPrintable, length);
-            } else {
-                return null;
+            Bounds bounds = parseBounds.apply(regex);
+            int minNeeded = Math.max(1, bounds.min);
+            Integer maxCap = bounds.max; // puede ser null (sin tope)
+
+            // Recorremos los "slots" escribibles y concatenamos SOLO los dígitos
+            java.util.List<int[]> slots = findWritableSlots(all, 0);
+            if (slots.isEmpty()) return null;
+
+            StringBuilder sb = new StringBuilder();
+            int firstDigitByte = -1;
+
+            outer:
+            for (int[] s : slots) {
+                int start = s[0], len = s[1];
+                for (int i = 0; i < len; i++) {
+                    byte b = all[start + i];
+                    if (b >= '0' && b <= '9') {
+                        if (firstDigitByte < 0) firstDigitByte = start + i; // anclar al primer dígito real
+                        sb.append((char)b);
+                        if (maxCap != null && sb.length() >= maxCap) break outer;
+                    }
+                }
             }
+
+            if (sb.length() >= minNeeded && firstDigitByte >= 0) {
+                // Si excede max (por seguridad), recortar
+                if (maxCap != null && sb.length() > maxCap) {
+                    sb.setLength(maxCap);
+                }
+                return new FieldDetect(sb.toString(), sectorIndex, firstDigitByte, sb.length());
+            }
+
+            return null;
+
         } catch (Exception e) {
             android.util.Log.w("MIFARE_DETECT", e);
             return null;
         } finally {
-            // [Sección] Cierre defensivo
             try { mc.close(); } catch (Exception ignored) {}
         }
+    }
+
+    // --- helpers locales para replaceFieldInSector ---
+    private static boolean isAllowedForNumericSlot(byte b) {
+        // dígito ASCII, espacio o 0x00 (padding)
+        return (b >= '0' && b <= '9') || b == 0x20 || b == 0x00;
+    }
+
+    /** Busca "slots" escribibles (runs contiguos de [0-9] / espacio / 0x00) aunque estén vacíos. */
+    private static java.util.List<int[]> findWritableSlots(byte[] all, int fromByte) {
+        java.util.ArrayList<int[]> slots = new java.util.ArrayList<>();
+        int i = Math.max(0, fromByte);
+        while (i < all.length) {
+            // avanza hasta el próximo byte permitido
+            while (i < all.length && !isAllowedForNumericSlot(all[i])) i++;
+            if (i >= all.length) break;
+
+            int start = i;
+            // extiende mientras sea permitido (esto define el "span" del slot)
+            while (i < all.length && isAllowedForNumericSlot(all[i])) i++;
+            int span = i - start;
+
+            if (span > 0) slots.add(new int[]{ start, span });
+        }
+        return slots;
     }
 
     /**
@@ -172,24 +249,19 @@ class MifareClassicHelper {
      *   los bloques del sector, relee y verifica byte a byte la zona afectada.
      */
     static WriteOutcome replaceFieldInSector(Tag tag, FieldDetect field, String newValue, byte[] key) {
-        // [Sección] Validaciones de entrada
         if (tag == null || field == null) return WriteOutcome.fail("Parámetros inválidos.", "null input");
 
-        // [Sección] Obtener interfaz MIFARE
         MifareClassic mc = MifareClassic.get(tag);
         if (mc == null) return WriteOutcome.fail("Tag no soporta MifareClassic.", "mc==null");
 
-        // [Sección] Convertir nuevo valor a bytes UTF-8
-        byte[] newBytes = (newValue == null) ? new byte[0] : newValue.getBytes(StandardCharsets.UTF_8);
+        byte[] newBytes = (newValue == null) ? new byte[0] : newValue.getBytes(java.nio.charset.StandardCharsets.UTF_8);
 
         try {
-            // [Sección] Conectar y autenticar sector
             mc.connect();
             boolean auth = mc.authenticateSectorWithKeyA(field.sectorIndex, key);
             if (!auth) auth = mc.authenticateSectorWithKeyB(field.sectorIndex, key);
-            if (!auth) return WriteOutcome.fail("No se pudo autenticar sector para escribir.", "auth failed sector=" + field.sectorIndex);
+            if (!auth) return WriteOutcome.fail("No se pudo autenticar el sector para escribir.", "auth failed sector=" + field.sectorIndex);
 
-            // [Sección] Calcular bloques de datos y leer todo el sector (excepto trailer)
             int firstBlock = mc.sectorToBlock(field.sectorIndex);
             int dataBlocks = mc.getBlockCountInSector(field.sectorIndex) - 1; // excluye trailer
             int totalBytes = dataBlocks * MifareClassic.BLOCK_SIZE;
@@ -202,27 +274,46 @@ class MifareClassicHelper {
                 p += b.length;
             }
 
-            // [Sección] Determinar cuánto espacio contiguo hay desde byteStart
-            int start = field.byteStart;
-            if (start < 0 || start >= all.length) {
-                return WriteOutcome.fail("Posición de inicio fuera de rango.", "start=" + start + " total=" + all.length);
-            }
-            int maxSpan = computeNumericFieldSpan(all, start);
-            if (maxSpan <= 0) {
-                return WriteOutcome.fail("No hay espacio contiguo disponible para expandir el campo.", "maxSpan<=0");
+            // 1) Encontrar slots escribibles desde el byteStart del campo detectado
+            java.util.List<int[]> slots = findWritableSlots(all, field.byteStart);
+            if (slots.isEmpty()) {
+                return WriteOutcome.fail("No hay espacio escribible en el sector (slots no encontrados).", "no writable slots");
             }
 
-            // [Sección] Preparar reemplazo: truncar si excede el span y rellenar con espacios
-            int cap = Math.min(maxSpan, all.length - start);
-            byte[] replacement = new byte[cap];
-            java.util.Arrays.fill(replacement, (byte)0x20); // padding con espacios
-            int copyLen = Math.min(cap, newBytes.length);
-            System.arraycopy(newBytes, 0, replacement, 0, copyLen);
+            // 2) Escribir newBytes repartiendo y LIMPIAR con espacios el resto
+            int writePosInNew = 0;
+            boolean anyWritten = false;
 
-            // [Sección] Sobrescribir en el buffer contiguo
-            System.arraycopy(replacement, 0, all, start, cap);
+            for (int[] s : slots) {
+                int start = s[0], span = s[1];
+                if (span <= 0) continue;
 
-            // [Sección] Escribir bloque a bloque todo el segmento de datos del sector
+                // Capacidad real del slot (no cruzar separadores “no permitidos” dentro del slot)
+                int cap = Math.min(span, all.length - start);
+
+                // Prepara un buffer del tamaño del slot, relleno con espacios (0x20)
+                byte[] slotBuf = new byte[cap];
+                java.util.Arrays.fill(slotBuf, (byte)0x20);
+
+                // ¿hay bytes por escribir? si sí, copia el chunk y el resto queda como espacios
+                int remaining = newBytes.length - writePosInNew;
+                if (remaining > 0) {
+                    int chunk = Math.min(cap, remaining);
+                    System.arraycopy(newBytes, writePosInNew, slotBuf, 0, chunk);
+                    writePosInNew += chunk;
+                    anyWritten = true;
+                }
+                // Si NO hay bytes por escribir, igual dejamos TODO el slot en espacios (limpieza)
+
+                // Vuelca el slot al buffer total
+                System.arraycopy(slotBuf, 0, all, start, cap);
+            }
+
+            if (!anyWritten && newBytes.length > 0) {
+                return WriteOutcome.fail("No hubo espacio para escribir el nuevo valor.", "no capacity");
+            }
+
+            // 3) Escribir de regreso los bloques de datos del sector
             for (int i = 0; i < dataBlocks; i++) {
                 int blockIndex = firstBlock + i;
                 byte[] blockData = new byte[MifareClassic.BLOCK_SIZE];
@@ -230,7 +321,8 @@ class MifareClassicHelper {
                 mc.writeBlock(blockIndex, blockData);
             }
 
-            // [Sección] Releer para verificar byte a byte la zona reemplazada
+            // 4) Verificación: releer concatenando dígitos a través de slots y comparar
+            //    (usa tu lectura flexible; aquí lo hacemos directo para no depender de UI)
             byte[] back = new byte[totalBytes];
             p = 0;
             for (int i = 0; i < dataBlocks; i++) {
@@ -238,77 +330,42 @@ class MifareClassicHelper {
                 System.arraycopy(b, 0, back, p, b.length);
                 p += b.length;
             }
-            for (int i = 0; i < cap; i++) {
-                if (back[start + i] != replacement[i]) {
-                    return WriteOutcome.fail("Verificación falló (bytes distintos tras escribir).", "verify mismatch at +" + i);
+
+            // Reconstruir concatenación de dígitos recorriendo slots
+            StringBuilder seen = new StringBuilder();
+            java.util.List<int[]> verifySlots = findWritableSlots(back, field.byteStart);
+            outer:
+            for (int[] s : verifySlots) {
+                int start = s[0], len = s[1];
+                for (int i = 0; i < len; i++) {
+                    byte bb = back[start + i];
+                    if (bb >= '0' && bb <= '9') {
+                        seen.append((char)bb);
+                    }
+                    // si queremos parar exactamente cuando ya igualamos la longitud del nuevo valor:
+                    if (seen.length() >= newBytes.length) break outer;
                 }
             }
 
-            // [Sección] Mensaje final con aviso de truncamiento si aplica
-            String note = (newBytes.length > cap)
-                    ? " (truncado a " + cap + " bytes disponibles)"
-                    : "";
-            return WriteOutcome.ok("Campo actualizado a '" + newValue + "'" + note);
+            String after = seen.toString();
+            boolean exact = after.equals(newValue);
+            boolean prefix = after.startsWith(newValue); // por si el lector armado recupera más allá (no debería si limpiamos)
+
+            if (!exact) {
+                // si quedó de más (arrastre), esta versión ya lo reemplazó por espacios; si falla es por truncamiento
+                return WriteOutcome.fail("Verificación falló: lo releído no coincide.", "after=" + after);
+            }
+
+            // Si se escribieron menos bytes que la suma de slots (el caso que te interesa),
+            // ya quedaron espacios en los demás slots, así que la próxima lectura/detección NO arrastrará basura.
+            return WriteOutcome.ok("Número actualizado y slots siguientes limpiados con espacios.");
 
         } catch (java.io.IOException e) {
             return WriteOutcome.fail("Error E/S durante la escritura. Mantén el tag quieto.", "IOException: " + e.getMessage());
         } catch (Exception e) {
             return WriteOutcome.fail("Fallo inesperado al escribir.", "Exception: " + e.getMessage());
         } finally {
-            // [Sección] Cierre defensivo
             try { mc.close(); } catch (Exception ignored) {}
         }
-    }
-
-    // --------------------------------------------------------------------------------------------
-    // Funciones privadas (helpers)
-    // --------------------------------------------------------------------------------------------
-
-    /**
-     * Entradas:
-     *   - all (byte[]): buffer contiguo de los bytes de datos del sector.
-     *   - start (int): posición de inicio para medir el span.
-     * Salidas:
-     *   - (int): cantidad de bytes contiguos desde start que son dígitos '0'..'9' o padding (0x20 o 0x00).
-     * Descripción:
-     *   Recorre el buffer a partir de start contando los bytes válidos para un campo numérico
-     *   expandible (dígitos o relleno). Se usa para saber cuánto cabe al reemplazar.
-     */
-    private static int computeNumericFieldSpan(byte[] all, int start) {
-        // [Sección] Recorrer mientras se mantenga dígito o padding
-        int i = start;
-        while (i < all.length) {
-            int v = all[i] & 0xFF;
-            boolean isDigit = (v >= 0x30 && v <= 0x39);
-            boolean isPad   = (v == 0x20 || v == 0x00);
-            if (isDigit || isPad) i++; else break;
-        }
-        return i - start;
-    }
-
-    /**
-     * Entradas:
-     *   - b (byte[]): arreglo de bytes leídos.
-     * Salidas:
-     *   - (String): texto con caracteres ASCII imprimibles; bytes no imprimibles se muestran como '.'.
-     * Descripción:
-     *   Convierte bytes a una representación segura para UI/logs y recorta puntos finales (padding).
-     */
-    static String toAsciiPrintable(byte[] b) {
-        // [Sección] Nulos
-        if (b == null) return "";
-
-        // [Sección] Convertir byte por byte a rango ASCII imprimible
-        StringBuilder sb = new StringBuilder(b.length);
-        for (byte x : b) {
-            int v = x & 0xFF;
-            if (v >= 32 && v <= 126) sb.append((char) v);
-            else sb.append('.');
-        }
-
-        // [Sección] Recortar padding de puntos al final
-        int end = sb.length();
-        while (end > 0 && sb.charAt(end - 1) == '.') end--;
-        return sb.substring(0, end);
     }
 }
