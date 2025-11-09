@@ -24,7 +24,7 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
      *  - READ_ARMED: esperando un tag para leer
      *  - EDIT_ON_DETECT: esperando un tag para editar/escribir
      */
-    private enum Mode { IDLE, READ_ARMED, EDIT_ON_DETECT, DELETE, INVENTORY}
+    private enum Mode { IDLE, READ_ARMED, EDIT_ON_DETECT, DELETE, INVENTORY, EDIT_WRITE_FIXED}
 
     // --------------------------------------------------------------------------------------------
     // Atributos (Campos/Propiedades)
@@ -71,6 +71,9 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
 
     /** Ventana de tiempo (ms) para ignorar múltiples callbacks consecutivos tras una escritura. */
     private static final long SQUELCH_MS = 1500;
+
+    private String pendingFixedWriteValue = null;
+    private boolean afterWriteAskDescription = false; // si true, tras escribir pedimos desc y agregamos al inventario
 
     // --------------------------------------------------------------------------------------------
     // Interfaz interna para la confirmación del diálogo
@@ -243,9 +246,51 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                     tvEstado.setText("Escritura simulada.");
                 });
             } else {
-                // Armar modo edición: la app pedirá tag y luego abrirá diálogo
-                mode = Mode.EDIT_ON_DETECT;
-                tvEstado.setText("Acerca el tag para EDITAR su contenido.");
+                String[] opciones = {"Editar NFC", "Inventario"};
+                new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("Editar")
+                        .setItems(opciones, (d, which) -> {
+                            if (which == 0) {
+                                // Editar NFC normal (como ya lo tenés)
+                                mode = Mode.EDIT_ON_DETECT;
+                                tvEstado.setText("Acerque el NFC para editar.");
+                            } else {
+                                // Submenú inventario
+                                String[] invOps = {"Agregar a Inventario", "Agregar desde Inventario"};
+                                new AlertDialog.Builder(MainActivity.this)
+                                        .setTitle("Editar → Inventario")
+                                        .setItems(invOps, (d2, w2) -> {
+                                            if (w2 == 0) {
+                                                // Agregar a Inventario: pedir ID a escribir
+                                                showInputDialog("ID a escribir en NFC", "", idNuevo -> {
+                                                    if (idNuevo == null || idNuevo.trim().isEmpty()) {
+                                                        tvEstado.setText("ID vacío.");
+                                                        return;
+                                                    }
+                                                    // Preparar escritura fija
+                                                    pendingFixedWriteValue = idNuevo.trim();
+                                                    afterWriteAskDescription = true; // porque al terminar vamos a pedir descripción y agregar fila
+                                                    mode = Mode.EDIT_WRITE_FIXED;
+                                                    tvEstado.setText("Acerque el NFC para escribir ID: " + pendingFixedWriteValue);
+                                                });
+                                            } else {
+                                                // Agregar desde Inventario: seleccionar ID del XLSX y escribirlo al NFC
+                                                dataBase.selectIdFromInventory(new DataBase.SelectCallback() {
+                                                    @Override public void onSelected(String id, String descripcion) {
+                                                        pendingFixedWriteValue = id;
+                                                        afterWriteAskDescription = false; // ya existe en inventario, no agregamos fila
+                                                        mode = Mode.EDIT_WRITE_FIXED;
+                                                        tvEstado.setText("Acerque el NFC para escribir ID: " + pendingFixedWriteValue + " (" + descripcion + ")");
+                                                    }
+                                                    @Override public void onCancel(String reason) {
+                                                        tvEstado.setText(reason);
+                                                    }
+                                                });
+                                            }
+                                        }).show();
+                            }
+                        })
+                        .show();
             }
         });
     }
@@ -493,6 +538,58 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                 });
                 break;
             }
+            case EDIT_WRITE_FIXED: {
+                Executors.newSingleThreadExecutor().execute(() -> {
+                    if (MifareClassic.get(tag) == null) {
+                        safeRunOnUi(() -> {
+                            tvEstado.setText("Tag no MifareClassic.");
+                            mode = Mode.IDLE;
+                        });
+                        return;
+                    }
+
+                    // Detectar el campo editable (igual que en tu EDIT_ON_DETECT)
+                    FieldDetect fd = MifareClassicHelper.detectFieldInSector(tag, /*sectorIndex*/1, "\\d+", MifareClassicHelper.KEY_DEFAULT);
+                    if (fd == null) {
+                        safeRunOnUi(() -> {
+                            tvEstado.setText("No se encontró campo numérico en sector 1 (o no se pudo autenticar).");
+                            mode = Mode.IDLE;
+                        });
+                        return;
+                    }
+
+                    // Escribir el valor fijo
+                    WriteOutcome out = MifareClassicHelper.replaceFieldInSector(tag, fd, pendingFixedWriteValue, MifareClassicHelper.KEY_DEFAULT);
+
+                    safeRunOnUi(() -> {
+                        if (out.ok) {
+                            tvSalida.setText("Escrito: " + pendingFixedWriteValue);
+                            tvEstado.setText("Escritura OK.");
+                            lastWriteMs = System.currentTimeMillis();
+
+                            if (afterWriteAskDescription) {
+                                // Pedir descripción y agregar al inventario
+                                String idEscrito = pendingFixedWriteValue; // capturar
+                                showInputDialog("Descripción para " + idEscrito, "", desc -> {
+                                    if (desc == null) desc = "";
+                                    dataBase.addItemToInventory(idEscrito, desc, new DataBase.Callback() {
+                                        @Override public void ok(String msg)  { runOnUiThread(() -> tvEstado.setText("Agregado al inventario. " + msg)); }
+                                        @Override public void fail(String err){ runOnUiThread(() -> tvEstado.setText("Error al agregar: " + err)); }
+                                    });
+                                });
+                            }
+                        } else {
+                            tvEstado.setText(out.userMessage);
+                            android.util.Log.w("MIFARE_WRITE", out.technicalDetail);
+                        }
+                        // limpiar estado
+                        pendingFixedWriteValue = null;
+                        afterWriteAskDescription = false;
+                        mode = Mode.IDLE;
+                    });
+                });
+                break;
+            }
             // ------------------------------------------------------------------------------------
             // Sin modo seleccionado
             // ------------------------------------------------------------------------------------
@@ -541,6 +638,18 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                     pendingEditTag = null;
                     mode = Mode.IDLE;
                 })
+                .show();
+    }
+
+    private void showInputDialog(String title, String hint, java.util.function.Consumer<String> onOk) {
+        final EditText et = new EditText(this);
+        et.setHint(hint);
+        et.setInputType(InputType.TYPE_CLASS_TEXT);
+        new AlertDialog.Builder(this)
+                .setTitle(title)
+                .setView(et)
+                .setPositiveButton("OK", (d, w) -> onOk.accept(et.getText().toString()))
+                .setNegativeButton("Cancelar", null)
                 .show();
     }
 }

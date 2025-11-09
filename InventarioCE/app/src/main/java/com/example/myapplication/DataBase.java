@@ -5,6 +5,8 @@ import android.content.Context;
 import android.net.Uri;
 import android.provider.DocumentsContract;
 import android.content.Intent;
+import android.text.InputType;
+import android.widget.EditText;
 
 import androidx.activity.result.ActivityResultCaller;
 import androidx.activity.result.ActivityResultLauncher;
@@ -33,6 +35,11 @@ public class DataBase {
     public interface Callback {
         void ok(String msg);
         void fail(String err);
+    }
+
+    public interface SelectCallback {
+        void onSelected(String id, String descripcion);
+        void onCancel(String reason);
     }
 
     private final Context context;
@@ -834,6 +841,121 @@ public class DataBase {
             } catch (Exception e) {
                 try { if (wb != null) wb.close(); } catch (Exception ignore) {}
                 if (cb != null) cb.fail("Error marcando: " + e.getMessage());
+            }
+        }).start();
+    }
+
+    public void addItemToInventory(String id, String descripcion, Callback cb) {
+        Uri uri = getCurrentInventoryUri();
+        if (uri == null) { if (cb != null) cb.fail("No hay inventario actual."); return; }
+        if (id == null || id.trim().isEmpty()) { if (cb != null) cb.fail("ID vacío."); return; }
+
+        new Thread(() -> {
+            Workbook wb = null;
+            try (InputStream is = context.getContentResolver().openInputStream(uri)) {
+                wb = WorkbookFactory.create(is);
+                Sheet sheet = wb.getNumberOfSheets() > 0 ? wb.getSheetAt(0) : null;
+                if (sheet == null) { if (cb != null) cb.fail("El archivo no tiene hojas."); return; }
+
+                // localizar/crear headers
+                Row header = sheet.getRow(sheet.getFirstRowNum());
+                if (header == null) { header = sheet.createRow(0); }
+                int colId = -1, colDesc = -1, colEstado = -1;
+                short min = header.getFirstCellNum() == -1 ? 0 : header.getFirstCellNum();
+                short max = header.getLastCellNum()  == -1 ? 0 : header.getLastCellNum();
+
+                // Buscar por nombre; si faltan, crearlos al final
+                for (int c = min; c < max; c++) {
+                    String name = cellToString(header.getCell(c)).trim().toLowerCase();
+                    if (name.equals("id")) colId = c;
+                    else if (name.equals("descripcion")) colDesc = c;
+                    else if (name.equals("estado")) colEstado = c;
+                }
+                if (colId < 0)   { colId   = max++; header.createCell(colId).setCellValue("id"); }
+                if (colDesc < 0) { colDesc = max++; header.createCell(colDesc).setCellValue("descripcion"); }
+                if (colEstado < 0){ colEstado = max++; header.createCell(colEstado).setCellValue("estado"); }
+
+                int newRowIdx = sheet.getLastRowNum() + 1;
+                if (newRowIdx == 0) newRowIdx = 1; // por si no había filas
+                Row row = sheet.createRow(newRowIdx);
+                row.createCell(colId).setCellValue(id);
+                row.createCell(colDesc).setCellValue(descripcion == null ? "" : descripcion);
+                row.createCell(colEstado).setCellValue("No encontrado");
+
+                try (OutputStream os = context.getContentResolver().openOutputStream(uri)) {
+                    if (os == null) throw new IllegalStateException("OutputStream nulo.");
+                    wb.write(os);
+                    os.flush();
+                }
+                wb.close();
+                if (cb != null) cb.ok("ID " + id + " agregado.");
+            } catch (Exception e) {
+                try { if (wb != null) wb.close(); } catch (Exception ignore) {}
+                if (cb != null) cb.fail("Error al agregar: " + e.getMessage());
+            }
+        }).start();
+    }
+
+    public void selectIdFromInventory(SelectCallback cb) {
+        Uri uri = getCurrentInventoryUri();
+        if (uri == null) { cb.onCancel("No hay inventario actual."); return; }
+
+        new Thread(() -> {
+            Workbook wb = null;
+            try (InputStream is = context.getContentResolver().openInputStream(uri)) {
+                wb = WorkbookFactory.create(is);
+                Sheet sheet = wb.getNumberOfSheets() > 0 ? wb.getSheetAt(0) : null;
+                if (sheet == null) { cb.onCancel("El archivo no tiene hojas."); return; }
+
+                Row header = sheet.getRow(sheet.getFirstRowNum());
+                if (header == null) { cb.onCancel("No se encontró encabezado."); return; }
+
+                int colId = -1, colDesc = -1;
+                short min = header.getFirstCellNum(), max = header.getLastCellNum();
+                for (int c = min; c < max; c++) {
+                    String name = cellToString(header.getCell(c)).trim().toLowerCase();
+                    if (name.equals("id")) colId = c;
+                    else if (name.equals("descripcion")) colDesc = c;
+                }
+                if (colId < 0 || colDesc < 0) { cb.onCancel("Faltan columnas 'id'/'descripcion'."); return; }
+
+                List<String> labels = new ArrayList<>();
+                List<String> ids = new ArrayList<>();
+                List<String> descs = new ArrayList<>();
+
+                int first = sheet.getFirstRowNum(), last = sheet.getLastRowNum();
+                for (int r = first + 1; r <= last; r++) {
+                    Row row = sheet.getRow(r);
+                    if (row == null) continue;
+                    String id  = cellToString(row.getCell(colId));
+                    String ds  = cellToString(row.getCell(colDesc));
+                    if (id == null || id.isEmpty()) continue;
+                    labels.add(id + " – " + (ds == null ? "" : ds));
+                    ids.add(id);
+                    descs.add(ds == null ? "" : ds);
+                }
+                Workbook finalWb = wb; // para cerrar luego
+                new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+                    if (labels.isEmpty()) { cb.onCancel("No hay elementos en inventario."); try{finalWb.close();}catch(Exception ignore){} return; }
+
+                    final int[] pick = {-1};
+                    new AlertDialog.Builder(context)
+                            .setTitle("Selecciona ID")
+                            .setSingleChoiceItems(labels.toArray(new String[0]), -1, (d, w) -> pick[0] = w)
+                            .setPositiveButton("Usar", (d, w) -> {
+                                if (pick[0] < 0) { cb.onCancel("No se seleccionó ID."); }
+                                else { cb.onSelected(ids.get(pick[0]), descs.get(pick[0])); }
+                                try { finalWb.close(); } catch (Exception ignore) {}
+                            })
+                            .setNegativeButton("Cancelar", (d, w) -> {
+                                cb.onCancel("Cancelado.");
+                                try { finalWb.close(); } catch (Exception ignore) {}
+                            })
+                            .show();
+                });
+            } catch (Exception e) {
+                try { if (wb != null) wb.close(); } catch (Exception ignore) {}
+                cb.onCancel("Error abriendo inventario: " + e.getMessage());
             }
         }).start();
     }
