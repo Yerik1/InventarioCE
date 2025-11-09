@@ -45,6 +45,15 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
     /** Botón para iniciar el flujo de escritura/edición. */
     private Button btnEscribir;
 
+    /** Botón para crear un nuevo inventario desde XLSX. */
+    private Button btnNuevoInventario;
+
+    /** Botón para borrar (lógica vacía por ahora). */
+    private Button btnBorrar;
+
+    /** Manejador de base de datos / archivos XLSX vía SAF */
+    private DataBase dataBase;
+
     /** Modo operativo actual de la Activity (idle, leer, editar). */
     private volatile Mode mode = Mode.IDLE;
 
@@ -100,6 +109,22 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
         tvSalida  = findViewById(R.id.tvSalida);
         btnLeer   = findViewById(R.id.btnLeer);
         btnEscribir = findViewById(R.id.btnEscribir);
+        btnNuevoInventario = findViewById(R.id.btnNuevoInventario);
+        btnBorrar          = findViewById(R.id.btnBorrar);
+
+        btnNuevoInventario.setOnClickListener(v -> dataBase.startNuevoInventario());
+        btnBorrar.setOnClickListener(v -> dataBase.startBorrar());
+
+        dataBase = new DataBase(
+                /* caller  */ this,
+                /* context */ this,
+                new DataBase.Logger() {
+                    @Override public void info(String msg)  { runOnUiThread(() -> tvEstado.setText(msg)); }
+                    @Override public void error(String msg) { runOnUiThread(() -> tvEstado.setText(msg)); }
+                    @Override public void toast(String msg) { runOnUiThread(() -> Toast.makeText(MainActivity.this, msg, Toast.LENGTH_SHORT).show()); }
+                }
+        );
+
 
         // [Sección] Detección de entorno (emulador vs dispositivo real)
         isEmulator =
