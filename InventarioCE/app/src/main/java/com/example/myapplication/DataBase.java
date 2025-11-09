@@ -43,11 +43,22 @@ public class DataBase {
     private Workbook sourceWb = null;
 
     // Abrir XLSX para borrar
+    private final ActivityResultLauncher<String[]> pickCurrentInventoryLauncher;
+
     private final ActivityResultLauncher<String[]> openForDeleteLauncher;
 
     // Estado temporal para borrar
     private Workbook deleteWb = null;
     private Uri deleteUri = null;
+
+    // Prefs para recordar el inventario actual
+    private final android.content.SharedPreferences prefs;
+    private static final String PREFS_NAME = "inv_prefs";
+    private static final String KEY_CURRENT_INVENTORY_URI = "current_inventory_uri";
+
+    // Modo "borrar por NFC": estamos esperando tag
+    private volatile boolean waitingNfcDelete = false;
+
 
     // Estructura mínima para mostrar opciones de borrado
     private static class RowInfo {
@@ -65,6 +76,7 @@ public class DataBase {
         this.caller = caller;
         this.context = context;
         this.logger = logger;
+        prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
 
         openXlsxLauncher = caller.registerForActivityResult(
                 new ActivityResultContracts.OpenDocument(),
@@ -80,6 +92,11 @@ public class DataBase {
                 new ActivityResultContracts.OpenDocument(),
                 this::onOpenForDeleteResult
         );
+
+        pickCurrentInventoryLauncher = caller.registerForActivityResult(
+                new ActivityResultContracts.OpenDocument(),
+                this::onPickCurrentInventoryResult
+        );
     }
 
     public void startNuevoInventario() {
@@ -90,12 +107,206 @@ public class DataBase {
         });
     }
 
+    private void setCurrentInventoryUri(@androidx.annotation.Nullable Uri uri, boolean takePersistable) {
+        if (uri == null) {
+            prefs.edit().putString(KEY_CURRENT_INVENTORY_URI, "").apply();
+            return;
+        }
+        prefs.edit().putString(KEY_CURRENT_INVENTORY_URI, uri.toString()).apply();
+        if (takePersistable) {
+            try {
+                context.getContentResolver().takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                );
+            } catch (Exception ignored) {}
+        }
+    }
+
+    @androidx.annotation.Nullable
+    private Uri getCurrentInventoryUri() {
+        String s = prefs.getString(KEY_CURRENT_INVENTORY_URI, "");
+        if (s == null || s.isEmpty()) return null;
+        return Uri.parse(s);
+    }
+
+    private boolean hasCurrentInventory() {
+        return getCurrentInventoryUri() != null;
+    }
+
     public void startBorrar() {
-        logger.info("Selecciona el archivo XLSX para borrar un elemento...");
-        openForDeleteLauncher.launch(new String[]{
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                "application/vnd.ms-excel"
-        });
+        final String[] opciones = {"Desde lista", "Desde NFC"};
+        new AlertDialog.Builder(context)
+                .setTitle("Borrar elemento")
+                .setItems(opciones, (d, which) -> {
+                    if (which == 0) {
+                        // Lista (flujo que ya tenías)
+                        logger.info("Selecciona el archivo XLSX para borrar un elemento...");
+                        openForDeleteLauncher.launch(new String[]{
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                "application/vnd.ms-excel"
+                        });
+                    } else {
+                        // NFC
+                        startBorrarPorNfc();
+                    }
+                })
+                .show();
+    }
+
+    public void startBorrarPorNfc() {
+        // ¿Tenemos inventario actual?
+        if (!hasCurrentInventory()) {
+            new AlertDialog.Builder(context)
+                    .setTitle("Inventario actual")
+                    .setMessage("No hay un inventario actual seleccionado. ¿Deseas elegir uno ahora?")
+                    .setPositiveButton("Elegir", (dd, ww) -> {
+                        pickCurrentInventoryLauncher.launch(new String[]{
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                "application/vnd.ms-excel"
+                        });
+                    })
+                    .setNegativeButton("Cancelar", null)
+                    .show();
+            return;
+        }
+        waitingNfcDelete = true;
+        logger.toast("Acerque el dispositivo al NFC para borrar.");
+    }
+
+    public void onNfcIdScanned(String idFromTag) {
+        if (!waitingNfcDelete) return; // ignorar si no estamos en modo borrado por NFC
+        waitingNfcDelete = false;
+
+        if (idFromTag == null || idFromTag.trim().isEmpty()) {
+            logger.error("ID NFC vacío.");
+            return;
+        }
+
+        Uri invUri = getCurrentInventoryUri();
+        if (invUri == null) {
+            logger.error("No hay inventario actual.");
+            return;
+        }
+
+        new Thread(() -> {
+            Workbook wb = null;
+            try {
+                // Abrir inventario actual
+                try (InputStream is = context.getContentResolver().openInputStream(invUri)) {
+                    wb = WorkbookFactory.create(is);
+                }
+                Sheet sheet = wb.getNumberOfSheets() > 0 ? wb.getSheetAt(0) : null;
+                if (sheet == null) {
+                    logger.error("El inventario no tiene hojas.");
+                    if (wb != null) wb.close();
+                    return;
+                }
+
+                // Buscar columnas id y descripcion
+                Row header = sheet.getRow(sheet.getFirstRowNum());
+                if (header == null) {
+                    logger.error("El inventario no tiene encabezados.");
+                    if (wb != null) wb.close();
+                    return;
+                }
+                int colId = -1, colDesc = -1;
+                short min = header.getFirstCellNum();
+                short max = header.getLastCellNum();
+                for (int c = min; c < max; c++) {
+                    String name = cellToString(header.getCell(c)).trim().toLowerCase();
+                    if (name.equals("id")) colId = c;
+                    else if (name.equals("descripcion")) colDesc = c;
+                }
+                if (colId < 0 || colDesc < 0) {
+                    logger.error("Encabezados 'id' y/o 'descripcion' no encontrados.");
+                    if (wb != null) wb.close();
+                    return;
+                }
+
+                // Buscar fila por ID
+                int first = sheet.getFirstRowNum();
+                int last  = sheet.getLastRowNum();
+                int foundRowIdx = -1;
+                String foundDesc = "";
+                for (int r = first + 1; r <= last; r++) {
+                    Row row = sheet.getRow(r);
+                    if (row == null) continue;
+                    String id = cellToString(row.getCell(colId)).trim();
+                    if (idFromTag.trim().equals(id)) {
+                        foundRowIdx = r;
+                        foundDesc = cellToString(row.getCell(colDesc));
+                        break;
+                    }
+                }
+
+                if (foundRowIdx < 0) {
+                    logger.toast("El ID leído (" + idFromTag + ") no pertenece al inventario actual.");
+                    if (wb != null) wb.close();
+                    return;
+                }
+
+                // Confirmación en UI
+                final int rowToDelete = foundRowIdx;
+                final String descToShow = foundDesc;
+                final Workbook wbFinal = wb;
+                final Uri invUriFinal = invUri;
+                new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+                    String msg = "¿Eliminar \"" + idFromTag + ": " + descToShow + "\" del inventario actual?";
+                    new AlertDialog.Builder(context)
+                            .setTitle("Confirmar borrado (NFC)")
+                            .setMessage(msg)
+                            .setPositiveButton("Eliminar", (d, w) -> performDeleteByUri(invUri, wbFinal, rowToDelete))
+                            .setNegativeButton("Cancelar", (d, w) -> {
+                                try { if (wbFinal != null) wbFinal.close(); } catch (Exception ignore) {}
+                            })
+                            .show();
+                });
+
+            } catch (Exception e) {
+                logger.error("Error al buscar ID en inventario: " + e.getMessage());
+                try { if (wb != null) wb.close(); } catch (Exception ignore) {}
+            }
+        }).start();
+    }
+
+    private void performDeleteByUri(Uri fileUri, Workbook wbAlreadyOpen, int rowIdxToDelete) {
+        new Thread(() -> {
+            Workbook wb = wbAlreadyOpen; // ya abierto
+            try {
+                Sheet sheet = wb.getSheetAt(0);
+                int lastRow = sheet.getLastRowNum();
+
+                if (rowIdxToDelete >= 0 && rowIdxToDelete < lastRow) {
+                    sheet.shiftRows(rowIdxToDelete + 1, lastRow, -1);
+                }
+                Row last = sheet.getRow(lastRow);
+                if (last != null) sheet.removeRow(last);
+
+                try (OutputStream os = context.getContentResolver().openOutputStream(fileUri)) {
+                    if (os == null) throw new IllegalStateException("OutputStream nulo para URI destino.");
+                    wb.write(os);
+                    os.flush();
+                }
+                wb.close();
+
+                logger.toast("Elemento eliminado por NFC.");
+            } catch (Exception e) {
+                logger.error("Error al borrar/guardar (NFC): " + e.getMessage());
+                try { if (wb != null) wb.close(); } catch (Exception ignore) {}
+            }
+        }).start();
+    }
+
+    private void onPickCurrentInventoryResult(Uri uri) {
+        if (uri == null) {
+            logger.error("No se seleccionó inventario actual.");
+            return;
+        }
+        setCurrentInventoryUri(uri, true);
+        logger.toast("Inventario actual establecido.");
+        waitingNfcDelete = true;
+        logger.info("Acerque el dispositivo al NFC para borrar.");
     }
 
     private void onOpenXlsxResult(Uri uri) {
@@ -261,6 +472,7 @@ public class DataBase {
                 headerNames = null;
                 pickedIdCol = -1;
                 pickedDescCol = -1;
+                setCurrentInventoryUri(destUri, true); // <- añade esta línea tras guardar OK
             }
         }).start();
     }

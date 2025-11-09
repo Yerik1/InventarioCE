@@ -24,7 +24,7 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
      *  - READ_ARMED: esperando un tag para leer
      *  - EDIT_ON_DETECT: esperando un tag para editar/escribir
      */
-    private enum Mode { IDLE, READ_ARMED, EDIT_ON_DETECT }
+    private enum Mode { IDLE, READ_ARMED, EDIT_ON_DETECT, DELETE}
 
     // --------------------------------------------------------------------------------------------
     // Atributos (Campos/Propiedades)
@@ -113,7 +113,21 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
         btnBorrar          = findViewById(R.id.btnBorrar);
 
         btnNuevoInventario.setOnClickListener(v -> dataBase.startNuevoInventario());
-        btnBorrar.setOnClickListener(v -> dataBase.startBorrar());
+        // En MainActivity (donde tienes el botón Borrar)
+        btnBorrar.setOnClickListener(v -> {
+            String[] opciones = {"Desde lista", "Desde NFC"};
+            new AlertDialog.Builder(this)
+                    .setTitle("Borrar elemento")
+                    .setItems(opciones, (d, which) -> {
+                        if (which == 0) {
+                            dataBase.startBorrar(); // tu flujo por lista
+                        } else {
+                            dataBase.startBorrarPorNfc(); // preparar inventario actual + flag interno
+                            mode = Mode.DELETE;              // <— activar modo NFC delete
+                            tvEstado.setText("Borrado por NFC armado: acerque el tag.");
+                        }
+                    }).show();
+        });
 
         dataBase = new DataBase(
                 /* caller  */ this,
@@ -352,6 +366,42 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                     });
                     break;
                 }
+            }
+            case DELETE: {
+                Executors.newSingleThreadExecutor().execute(() -> {
+                    if (MifareClassic.get(tag) != null) {
+                        String numero = MifareClassicHelper.readConcatNumericFromSector(
+                                tag,
+                                /* sector */ 1,
+                                MifareClassicHelper.KEY_DEFAULT,
+                                /* min */ 12        // usa el mismo mínimo que en lectura normal
+                        );
+
+                        safeRunOnUi(() -> {
+                            if (numero == null || numero.isEmpty()) {
+                                tvEstado.setText("No se encontró ID válido en el NFC para borrar.");
+                                tvSalida.setText("");
+                                mode = Mode.IDLE;
+                            } else {
+                                // Mostrar lo leído, y disparar la búsqueda/borrado en el XLSX actual
+                                tvSalida.setText(numero);
+                                tvEstado.setText("ID leído: " + numero + ". Buscando en inventario...");
+                                dataBase.onNfcIdScanned(numero);
+                                // Regresa a IDLE; el diálogo de confirmación del borrado lo maneja DataBase
+                                mode = Mode.IDLE;
+                            }
+                        });
+                        return;
+                    }
+
+                    // Tag no MifareClassic
+                    safeRunOnUi(() -> {
+                        tvSalida.setText("");
+                        tvEstado.setText("Tag no MifareClassic.");
+                        mode = Mode.IDLE;
+                    });
+                });
+                break;
             }
 
             // ------------------------------------------------------------------------------------
