@@ -24,7 +24,7 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
      *  - READ_ARMED: esperando un tag para leer
      *  - EDIT_ON_DETECT: esperando un tag para editar/escribir
      */
-    private enum Mode { IDLE, READ_ARMED, EDIT_ON_DETECT, DELETE}
+    private enum Mode { IDLE, READ_ARMED, EDIT_ON_DETECT, DELETE, INVENTORY}
 
     // --------------------------------------------------------------------------------------------
     // Atributos (Campos/Propiedades)
@@ -169,9 +169,65 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                 tvEstado.setText("Lectura simulada.");
                 mode = Mode.IDLE;
             } else {
-                // Armar modo lectura para reaccionar al próximo tag
-                mode = Mode.READ_ARMED;
-                tvEstado.setText("Modo LECTURA armado: acerca el tag para leer.");
+                // Si ya estamos en inventario, ofrece detenerlo
+                if (mode == Mode.INVENTORY) {
+                    String[] opciones = {"Detener inventario"};
+                    new AlertDialog.Builder(MainActivity.this)
+                            .setTitle("Inventario en curso")
+                            .setItems(opciones, (d, which) -> {
+                                dataBase.stopInventorySession();
+                                mode = Mode.IDLE;
+                                tvEstado.setText("Inventario detenido.");
+                            })
+                            .show();
+                    return;
+                }
+
+                String[] opciones = {"Leer NFC", "Hacer inventario"};
+                new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("Selecciona acción")
+                        .setItems(opciones, (d, which) -> {
+                            if (which == 0) {
+                                // Leer NFC normal
+                                mode = Mode.READ_ARMED;
+                                tvEstado.setText("Acerque el NFC para leer.");
+                            } else {
+                                // Submenú de inventario
+                                String[] invOps = {"Reiniciar inventario", "Continuar inventario"};
+                                new AlertDialog.Builder(MainActivity.this)
+                                        .setTitle("Inventario")
+                                        .setItems(invOps, (d2, w2) -> {
+                                            if (w2 == 0) {
+                                                // Reiniciar estados y empezar sesión
+                                                dataBase.startInventorySession(/*resetFirst*/true, new DataBase.Callback() {
+                                                    @Override public void ok(String msg) {
+                                                        runOnUiThread(() -> {
+                                                            tvEstado.setText(msg + " | Acerque tags para inventario.");
+                                                            mode = Mode.INVENTORY;
+                                                        });
+                                                    }
+                                                    @Override public void fail(String err) {
+                                                        runOnUiThread(() -> tvEstado.setText(err));
+                                                    }
+                                                });
+                                            } else {
+                                                // Continuar sin reiniciar
+                                                dataBase.startInventorySession(/*resetFirst*/false, new DataBase.Callback() {
+                                                    @Override public void ok(String msg) {
+                                                        runOnUiThread(() -> {
+                                                            tvEstado.setText(msg + " | Acerque tags para inventario.");
+                                                            mode = Mode.INVENTORY;
+                                                        });
+                                                    }
+                                                    @Override public void fail(String err) {
+                                                        runOnUiThread(() -> tvEstado.setText(err));
+                                                    }
+                                                });
+                                            }
+                                        }).show();
+                            }
+                        })
+                        .show();
             }
         });
 
@@ -403,7 +459,40 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                 });
                 break;
             }
+            case INVENTORY: {
+                Executors.newSingleThreadExecutor().execute(() -> {
+                    if (MifareClassic.get(tag) != null) {
+                        String numero = MifareClassicHelper.readConcatNumericFromSector(
+                                tag,
+                                /*sector*/ 1,
+                                MifareClassicHelper.KEY_DEFAULT,
+                                /*min*/ 12
+                        );
 
+                        safeRunOnUi(() -> {
+                            if (numero == null || numero.isEmpty()) {
+                                tvSalida.setText("");
+                                tvEstado.setText("No se encontró ID válido en el tag.");
+                            } else {
+                                tvSalida.setText(numero);
+                                tvEstado.setText("ID leído: " + numero + ". Marcando en inventario...");
+                                dataBase.onInventoryIdScanned(numero, new DataBase.Callback() {
+                                    @Override public void ok(String msg)  { runOnUiThread(() -> tvEstado.setText(msg)); }
+                                    @Override public void fail(String err){ runOnUiThread(() -> tvEstado.setText(err)); }
+                                });
+                            }
+                            // OJO: no cambiamos a IDLE; seguimos en INVENTORY para lecturas consecutivas
+                        });
+                        return;
+                    }
+
+                    safeRunOnUi(() -> {
+                        tvSalida.setText("");
+                        tvEstado.setText("Tag no MifareClassic.");
+                    });
+                });
+                break;
+            }
             // ------------------------------------------------------------------------------------
             // Sin modo seleccionado
             // ------------------------------------------------------------------------------------

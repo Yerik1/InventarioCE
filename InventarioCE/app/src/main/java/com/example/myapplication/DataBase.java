@@ -30,6 +30,11 @@ public class DataBase {
         void toast(String msg);
     }
 
+    public interface Callback {
+        void ok(String msg);
+        void fail(String err);
+    }
+
     private final Context context;
     private final ActivityResultCaller caller;
     private final Logger logger;
@@ -58,6 +63,8 @@ public class DataBase {
 
     // Modo "borrar por NFC": estamos esperando tag
     private volatile boolean waitingNfcDelete = false;
+
+    private volatile boolean inventorySessionActive = false;
 
 
     // Estructura mínima para mostrar opciones de borrado
@@ -659,5 +666,175 @@ public class DataBase {
         try { if (deleteWb != null) deleteWb.close(); } catch (Exception ignore) {}
         deleteWb = null;
         deleteUri = null;
+    }
+
+    public void startInventorySession(boolean resetFirst, Callback cb) {
+        // Verificamos inventario actual
+        Uri uri = getCurrentInventoryUri();
+        if (uri == null) {
+            new AlertDialog.Builder(context)
+                    .setTitle("Inventario actual")
+                    .setMessage("No hay inventario actual. ¿Deseas elegir uno?")
+                    .setPositiveButton("Elegir", (dd, ww) -> {
+                        pickCurrentInventoryLauncher.launch(new String[]{
+                                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                "application/vnd.ms-excel"
+                        });
+                        // Cuando el usuario elija, no sabemos si quiere reiniciar o no;
+                        // por simplicidad: informamos y que vuelva a tocar el flujo.
+                        if (cb != null) cb.fail("Selecciona el inventario y vuelve a iniciar.");
+                    })
+                    .setNegativeButton("Cancelar", (dd, ww) -> {
+                        if (cb != null) cb.fail("Operación cancelada.");
+                    })
+                    .show();
+            return;
+        }
+
+        if (resetFirst) {
+            resetAllEstadosAsync(new Callback() {
+                @Override public void ok(String msg) {
+                    inventorySessionActive = true;
+                    if (cb != null) cb.ok("Inventario reiniciado. " + msg);
+                }
+                @Override public void fail(String err) {
+                    inventorySessionActive = false;
+                    if (cb != null) cb.fail(err);
+                }
+            });
+        } else {
+            inventorySessionActive = true;
+            if (cb != null) cb.ok("Continuando inventario.");
+        }
+    }
+
+    public void stopInventorySession() {
+        inventorySessionActive = false;
+    }
+
+    private void resetAllEstadosAsync(Callback cb) {
+        Uri uri = getCurrentInventoryUri();
+        if (uri == null) { if (cb != null) cb.fail("No hay inventario actual."); return; }
+
+        new Thread(() -> {
+            Workbook wb = null;
+            try (InputStream is = context.getContentResolver().openInputStream(uri)) {
+                wb = WorkbookFactory.create(is);
+                Sheet sheet = wb.getNumberOfSheets() > 0 ? wb.getSheetAt(0) : null;
+                if (sheet == null) { if (cb != null) cb.fail("El archivo no tiene hojas."); return; }
+
+                // localizar columnas
+                Row header = sheet.getRow(sheet.getFirstRowNum());
+                if (header == null) { if (cb != null) cb.fail("No se encontró encabezado."); return; }
+                int colId = -1, colDesc = -1, colEstado = -1;
+                short min = header.getFirstCellNum(), max = header.getLastCellNum();
+                for (int c = min; c < max; c++) {
+                    String name = cellToString(header.getCell(c)).trim().toLowerCase();
+                    if (name.equals("id")) colId = c;
+                    else if (name.equals("descripcion")) colDesc = c;
+                    else if (name.equals("estado")) colEstado = c;
+                }
+                // si no hay columna estado, la creamos al final
+                if (colEstado < 0) {
+                    colEstado = max;
+                    header.createCell(colEstado).setCellValue("estado");
+                }
+
+                int first = sheet.getFirstRowNum(), last = sheet.getLastRowNum();
+                int count = 0;
+                for (int r = first + 1; r <= last; r++) {
+                    Row row = sheet.getRow(r);
+                    if (row == null) continue;
+                    Cell ce = row.getCell(colEstado);
+                    if (ce == null) ce = row.createCell(colEstado);
+                    ce.setCellValue("No encontrado");
+                    count++;
+                }
+
+                try (OutputStream os = context.getContentResolver().openOutputStream(uri)) {
+                    if (os == null) throw new IllegalStateException("OutputStream nulo.");
+                    wb.write(os);
+                    os.flush();
+                }
+                wb.close();
+
+                if (cb != null) cb.ok("Estados reiniciados (" + count + " filas).");
+            } catch (Exception e) {
+                try { if (wb != null) wb.close(); } catch (Exception ignore) {}
+                if (cb != null) cb.fail("Error reiniciando: " + e.getMessage());
+            }
+        }).start();
+    }
+
+    public void onInventoryIdScanned(String idFromTag, Callback cb) {
+        if (!inventorySessionActive) { if (cb != null) cb.fail("Inventario no está activo."); return; }
+        if (idFromTag == null || idFromTag.trim().isEmpty()) { if (cb != null) cb.fail("ID vacío."); return; }
+
+        Uri uri = getCurrentInventoryUri();
+        if (uri == null) { if (cb != null) cb.fail("No hay inventario actual."); return; }
+
+        new Thread(() -> {
+            Workbook wb = null;
+            try (InputStream is = context.getContentResolver().openInputStream(uri)) {
+                wb = WorkbookFactory.create(is);
+                Sheet sheet = wb.getNumberOfSheets() > 0 ? wb.getSheetAt(0) : null;
+                if (sheet == null) { if (cb != null) cb.fail("El archivo no tiene hojas."); return; }
+
+                // localizar columnas
+                Row header = sheet.getRow(sheet.getFirstRowNum());
+                if (header == null) { if (cb != null) cb.fail("No se encontró encabezado."); return; }
+                int colId = -1, colDesc = -1, colEstado = -1;
+                short min = header.getFirstCellNum(), max = header.getLastCellNum();
+                for (int c = min; c < max; c++) {
+                    String name = cellToString(header.getCell(c)).trim().toLowerCase();
+                    if (name.equals("id")) colId = c;
+                    else if (name.equals("descripcion")) colDesc = c;
+                    else if (name.equals("estado")) colEstado = c;
+                }
+                if (colId < 0 || colDesc < 0) { if (cb != null) cb.fail("Faltan columnas 'id'/'descripcion'."); return; }
+                if (colEstado < 0) { // crea 'estado' si no existe
+                    colEstado = max;
+                    header.createCell(colEstado).setCellValue("estado");
+                }
+
+                // buscar por ID
+                int first = sheet.getFirstRowNum(), last = sheet.getLastRowNum();
+                int foundRowIdx = -1;
+                String foundDesc = "";
+                for (int r = first + 1; r <= last; r++) {
+                    Row row = sheet.getRow(r);
+                    if (row == null) continue;
+                    String id = cellToString(row.getCell(colId)).trim();
+                    if (idFromTag.trim().equals(id)) {
+                        foundRowIdx = r;
+                        foundDesc = cellToString(row.getCell(colDesc));
+                        // marcar encontrado
+                        Cell ce = row.getCell(colEstado);
+                        if (ce == null) ce = row.createCell(colEstado);
+                        ce.setCellValue("Encontrado");
+                        break;
+                    }
+                }
+
+                if (foundRowIdx < 0) {
+                    if (cb != null) cb.fail("ID no pertenece a este inventario.");
+                    if (wb != null) wb.close();
+                    return;
+                }
+
+                // guardar
+                try (OutputStream os = context.getContentResolver().openOutputStream(uri)) {
+                    if (os == null) throw new IllegalStateException("OutputStream nulo.");
+                    wb.write(os);
+                    os.flush();
+                }
+                wb.close();
+
+                if (cb != null) cb.ok("Marcado como Encontrado: " + idFromTag + " (" + foundDesc + ")");
+            } catch (Exception e) {
+                try { if (wb != null) wb.close(); } catch (Exception ignore) {}
+                if (cb != null) cb.fail("Error marcando: " + e.getMessage());
+            }
+        }).start();
     }
 }
