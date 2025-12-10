@@ -3,6 +3,8 @@ package com.example.myapplication;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.app.AlertDialog;
 
+import android.media.AudioManager;
+import android.media.ToneGenerator;
 import android.nfc.NfcAdapter;
 import android.nfc.Tag;
 import android.nfc.tech.MifareClassic;
@@ -20,56 +22,84 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
 
     /**
      * Representa el modo actual de la pantalla:
-     *  - IDLE: sin operación activa
-     *  - READ_ARMED: esperando un tag para leer
-     *  - EDIT_ON_DETECT: esperando un tag para editar/escribir
+     * - IDLE: sin operación activa
+     * - READ_ARMED: esperando un tag para leer
+     * - EDIT_ON_DETECT: esperando un tag para editar/escribir
      */
-    private enum Mode { IDLE, READ_ARMED, EDIT_ON_DETECT, DELETE, INVENTORY, EDIT_WRITE_FIXED}
+    private enum Mode {IDLE, READ_ARMED, EDIT_ON_DETECT, DELETE, INVENTORY, EDIT_WRITE_FIXED}
 
     // --------------------------------------------------------------------------------------------
     // Atributos (Campos/Propiedades)
     // --------------------------------------------------------------------------------------------
 
-    /** Adaptador del sistema para interactuar con el hardware NFC (activar modo lector, etc.) */
+    /**
+     * Adaptador del sistema para interactuar con el hardware NFC (activar modo lector, etc.)
+     */
     private NfcAdapter nfcAdapter;
 
-    /** Texto en UI para mostrar el estado general (instrucciones/errores/progreso). */
+    /**
+     * Texto en UI para mostrar el estado general (instrucciones/errores/progreso).
+     */
     private TextView tvEstado;
 
-    /** Texto en UI para mostrar el resultado principal (por ejemplo el número leído o info del tag). */
+    /**
+     * Texto en UI para mostrar el resultado principal (por ejemplo el número leído o info del tag).
+     */
     private TextView tvSalida;
 
-    /** Botón para iniciar el flujo de lectura. */
+    /**
+     * Botón para iniciar el flujo de lectura.
+     */
     private Button btnLeer;
 
-    /** Botón para iniciar el flujo de escritura/edición. */
+    /**
+     * Botón para iniciar el flujo de escritura/edición.
+     */
     private Button btnEscribir;
 
-    /** Botón para crear un nuevo inventario desde XLSX. */
+    /**
+     * Botón para crear un nuevo inventario desde XLSX.
+     */
     private Button btnNuevoInventario;
 
-    /** Botón para borrar (lógica vacía por ahora). */
+    /**
+     * Botón para borrar (lógica vacía por ahora).
+     */
     private Button btnBorrar;
 
-    /** Manejador de base de datos / archivos XLSX vía SAF */
+    /**
+     * Manejador de base de datos / archivos XLSX vía SAF
+     */
     private DataBase dataBase;
 
-    /** Modo operativo actual de la Activity (idle, leer, editar). */
+    /**
+     * Modo operativo actual de la Activity (idle, leer, editar).
+     */
     private volatile Mode mode = Mode.IDLE;
 
-    /** Último valor leído desde el tag, usado para prellenar el diálogo de edición. */
+    /**
+     * Último valor leído desde el tag, usado para prellenar el diálogo de edición.
+     */
     private volatile String lastReadValue = null;
 
-    /** Último tag detectado pendiente de escritura en modo EDIT_ON_DETECT. */
+    /**
+     * Último tag detectado pendiente de escritura en modo EDIT_ON_DETECT.
+     */
     private volatile Tag pendingEditTag = null;
 
-    /** Bandera para detectar si la app corre en emulador y habilitar comportamientos simulados. */
+    /**
+     * Bandera para detectar si la app corre en emulador y habilitar comportamientos simulados.
+     */
     private boolean isEmulator;
 
-    /** Momento (ms) del último write exitoso; se usa para filtrar lecturas/escrituras duplicadas seguidas. */
+    /**
+     * Momento (ms) del último write exitoso; se usa para filtrar lecturas/escrituras duplicadas seguidas.
+     */
     private volatile long lastWriteMs = 0;
 
-    /** Ventana de tiempo (ms) para ignorar múltiples callbacks consecutivos tras una escritura. */
+    /**
+     * Ventana de tiempo (ms) para ignorar múltiples callbacks consecutivos tras una escritura.
+     */
     private static final long SQUELCH_MS = 1500;
 
     private String pendingFixedWriteValue = null;
@@ -78,29 +108,36 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
     // --------------------------------------------------------------------------------------------
     // Interfaz interna para la confirmación del diálogo
     // --------------------------------------------------------------------------------------------
+
     /**
      * Descripción: Contrato para recibir el valor confirmado desde el diálogo de edición.
      */
-    private interface ConfirmCallback { void onConfirm(String value); }
+    private interface ConfirmCallback {
+        void onConfirm(String value);
+    }
 
     // --------------------------------------------------------------------------------------------
     // Utilitario: Toast corto
     // --------------------------------------------------------------------------------------------
+
     /**
      * Entradas: s (String) - mensaje a mostrar.
      * Salidas: Ninguna.
      * Descripción: Muestra un Toast corto con el texto proporcionado.
      */
-    private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_SHORT).show(); }
+    private void toast(String s) {
+        Toast.makeText(this, s, Toast.LENGTH_SHORT).show();
+    }
 
     // --------------------------------------------------------------------------------------------
     // Ciclo de vida: onCreate
     // --------------------------------------------------------------------------------------------
+
     /**
      * Entradas: savedInstanceState (Bundle) - estado previo si la Activity fue recreada.
      * Salidas: Ninguna (efecto sobre la UI y estado interno).
      * Descripción: Inicializa la UI, detecta capacidades NFC, configura listeners de botones y
-     *              establece el modo inicial de la pantalla.
+     * establece el modo inicial de la pantalla.
      */
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -108,12 +145,12 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
 
         // [Sección] Inflado de layout y referencias a vistas
         setContentView(R.layout.activity_main);
-        tvEstado  = findViewById(R.id.tvEstado);
-        tvSalida  = findViewById(R.id.tvSalida);
-        btnLeer   = findViewById(R.id.btnLeer);
+        tvEstado = findViewById(R.id.tvEstado);
+        tvSalida = findViewById(R.id.tvSalida);
+        btnLeer = findViewById(R.id.btnLeer);
         btnEscribir = findViewById(R.id.btnEscribir);
         btnNuevoInventario = findViewById(R.id.btnNuevoInventario);
-        btnBorrar          = findViewById(R.id.btnBorrar);
+        btnBorrar = findViewById(R.id.btnBorrar);
 
         btnNuevoInventario.setOnClickListener(v -> dataBase.startNuevoInventario());
         // En MainActivity (donde tienes el botón Borrar)
@@ -136,9 +173,20 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                 /* caller  */ this,
                 /* context */ this,
                 new DataBase.Logger() {
-                    @Override public void info(String msg)  { runOnUiThread(() -> tvEstado.setText(msg)); }
-                    @Override public void error(String msg) { runOnUiThread(() -> tvEstado.setText(msg)); }
-                    @Override public void toast(String msg) { runOnUiThread(() -> Toast.makeText(MainActivity.this, msg, Toast.LENGTH_SHORT).show()); }
+                    @Override
+                    public void info(String msg) {
+                        runOnUiThread(() -> tvEstado.setText(msg));
+                    }
+
+                    @Override
+                    public void error(String msg) {
+                        runOnUiThread(() -> tvEstado.setText(msg));
+                    }
+
+                    @Override
+                    public void toast(String msg) {
+                        runOnUiThread(() -> Toast.makeText(MainActivity.this, msg, Toast.LENGTH_SHORT).show());
+                    }
                 }
         );
 
@@ -203,26 +251,32 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                                             if (w2 == 0) {
                                                 // Reiniciar estados y empezar sesión
                                                 dataBase.startInventorySession(/*resetFirst*/true, new DataBase.Callback() {
-                                                    @Override public void ok(String msg) {
+                                                    @Override
+                                                    public void ok(String msg) {
                                                         runOnUiThread(() -> {
                                                             tvEstado.setText(msg + " | Acerque tags para inventario.");
                                                             mode = Mode.INVENTORY;
                                                         });
                                                     }
-                                                    @Override public void fail(String err) {
+
+                                                    @Override
+                                                    public void fail(String err) {
                                                         runOnUiThread(() -> tvEstado.setText(err));
                                                     }
                                                 });
                                             } else {
                                                 // Continuar sin reiniciar
                                                 dataBase.startInventorySession(/*resetFirst*/false, new DataBase.Callback() {
-                                                    @Override public void ok(String msg) {
+                                                    @Override
+                                                    public void ok(String msg) {
                                                         runOnUiThread(() -> {
                                                             tvEstado.setText(msg + " | Acerque tags para inventario.");
                                                             mode = Mode.INVENTORY;
                                                         });
                                                     }
-                                                    @Override public void fail(String err) {
+
+                                                    @Override
+                                                    public void fail(String err) {
                                                         runOnUiThread(() -> tvEstado.setText(err));
                                                     }
                                                 });
@@ -276,13 +330,16 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                                             } else {
                                                 // Agregar desde Inventario: seleccionar ID del XLSX y escribirlo al NFC
                                                 dataBase.selectIdFromInventory(new DataBase.SelectCallback() {
-                                                    @Override public void onSelected(String id, String descripcion) {
+                                                    @Override
+                                                    public void onSelected(String id, String descripcion) {
                                                         pendingFixedWriteValue = id;
                                                         afterWriteAskDescription = false; // ya existe en inventario, no agregamos fila
                                                         mode = Mode.EDIT_WRITE_FIXED;
                                                         tvEstado.setText("Acerque el NFC para escribir ID: " + pendingFixedWriteValue + " (" + descripcion + ")");
                                                     }
-                                                    @Override public void onCancel(String reason) {
+
+                                                    @Override
+                                                    public void onCancel(String reason) {
                                                         tvEstado.setText(reason);
                                                     }
                                                 });
@@ -298,6 +355,7 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
     // --------------------------------------------------------------------------------------------
     // Ciclo de vida: onResume
     // --------------------------------------------------------------------------------------------
+
     /**
      * Entradas: Ninguna.
      * Salidas: Ninguna (efecto en sistema NFC).
@@ -311,7 +369,7 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
 
         // [Sección] Habilitar modo lector si hay NFC
         if (nfcAdapter != null) {
-            int flags =  NfcAdapter.FLAG_READER_NFC_A
+            int flags = NfcAdapter.FLAG_READER_NFC_A
                     | NfcAdapter.FLAG_READER_NFC_B
                     | NfcAdapter.FLAG_READER_NFC_F
                     | NfcAdapter.FLAG_READER_NFC_V
@@ -324,6 +382,7 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
     // --------------------------------------------------------------------------------------------
     // Ciclo de vida: onPause
     // --------------------------------------------------------------------------------------------
+
     /**
      * Entradas: Ninguna.
      * Salidas: Ninguna (efecto en sistema NFC).
@@ -341,11 +400,12 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
     // --------------------------------------------------------------------------------------------
     // Utilitario de UI seguro
     // --------------------------------------------------------------------------------------------
+
     /**
      * Entradas: r (Runnable) - acción que se ejecutará en el hilo de UI.
      * Salidas: Ninguna.
      * Descripción: Ejecuta de forma segura un Runnable en el hilo principal evitando correr
-     *              cuando la Activity ya no es válida (finishing/destroyed).
+     * cuando la Activity ya no es válida (finishing/destroyed).
      */
     private void safeRunOnUi(Runnable r) {
         // [Sección] Cortocircuito si la Activity está finalizando o destruida
@@ -361,13 +421,14 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
     // --------------------------------------------------------------------------------------------
     // Callback NFC: onTagDiscovered
     // --------------------------------------------------------------------------------------------
+
     /**
      * Entradas: tag (Tag) - objeto del sistema que representa el tag NFC detectado.
      * Salidas: Ninguna (actualiza UI y ejecuta flujos de lectura/escritura).
      * Descripción: Punto de entrada cuando el dispositivo detecta un tag. Según el modo:
-     *   - READ_ARMED: lee campo numérico del sector 1 y lo muestra.
-     *   - EDIT_ON_DETECT: detecta el campo numérico, abre diálogo para editar y escribe reemplazo.
-     *   - IDLE: muestra recordatorio de seleccionar una acción.
+     * - READ_ARMED: lee campo numérico del sector 1 y lo muestra.
+     * - EDIT_ON_DETECT: detecta el campo numérico, abre diálogo para editar y escribe reemplazo.
+     * - IDLE: muestra recordatorio de seleccionar una acción.
      */
     @Override
     public void onTagDiscovered(Tag tag) {
@@ -399,6 +460,7 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                                 lastReadValue = numero;
                                 tvSalida.setText(numero);  // Se muestra solo el número
                                 tvEstado.setText("Lectura OK.");
+                                playSuccessBeep();
                             }
                             mode = Mode.IDLE;
                         });
@@ -455,6 +517,7 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                                         if (out.ok) {
                                             tvSalida.setText("Campo actualizado: " + newValue);
                                             lastWriteMs = System.currentTimeMillis();
+                                            playSuccessBeep();
                                         } else {
                                             android.util.Log.w("MIFARE_WRITE", out.technicalDetail);
                                         }
@@ -488,6 +551,7 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                                 tvSalida.setText(numero);
                                 tvEstado.setText("ID leído: " + numero + ". Buscando en inventario...");
                                 dataBase.onNfcIdScanned(numero);
+                                playSuccessBeep();
                                 // Regresa a IDLE; el diálogo de confirmación del borrado lo maneja DataBase
                                 mode = Mode.IDLE;
                             }
@@ -521,9 +585,17 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                             } else {
                                 tvSalida.setText(numero);
                                 tvEstado.setText("ID leído: " + numero + ". Marcando en inventario...");
+                                playSuccessBeep();
                                 dataBase.onInventoryIdScanned(numero, new DataBase.Callback() {
-                                    @Override public void ok(String msg)  { runOnUiThread(() -> tvEstado.setText(msg)); }
-                                    @Override public void fail(String err){ runOnUiThread(() -> tvEstado.setText(err)); }
+                                    @Override
+                                    public void ok(String msg) {
+                                        runOnUiThread(() -> tvEstado.setText(msg));
+                                    }
+
+                                    @Override
+                                    public void fail(String err) {
+                                        runOnUiThread(() -> tvEstado.setText(err));
+                                    }
                                 });
                             }
                             // OJO: no cambiamos a IDLE; seguimos en INVENTORY para lecturas consecutivas
@@ -548,8 +620,8 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                         return;
                     }
 
-                    // Detectar el campo editable (igual que en tu EDIT_ON_DETECT)
-                    FieldDetect fd = MifareClassicHelper.detectFieldInSector(tag, /*sectorIndex*/1, "\\d+", MifareClassicHelper.KEY_DEFAULT);
+                    FieldDetect fd = MifareClassicHelper.detectFieldInSector(
+                            tag, /*sectorIndex*/1, "\\d+", MifareClassicHelper.KEY_DEFAULT);
                     if (fd == null) {
                         safeRunOnUi(() -> {
                             tvEstado.setText("No se encontró campo numérico en sector 1 (o no se pudo autenticar).");
@@ -559,22 +631,139 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                     }
 
                     // Escribir el valor fijo
-                    WriteOutcome out = MifareClassicHelper.replaceFieldInSector(tag, fd, pendingFixedWriteValue, MifareClassicHelper.KEY_DEFAULT);
+                    WriteOutcome out = MifareClassicHelper.replaceFieldInSector(
+                            tag, fd, pendingFixedWriteValue, MifareClassicHelper.KEY_DEFAULT);
 
                     safeRunOnUi(() -> {
                         if (out.ok) {
                             tvSalida.setText("Escrito: " + pendingFixedWriteValue);
                             tvEstado.setText("Escritura OK.");
                             lastWriteMs = System.currentTimeMillis();
+                            playSuccessBeep();
+
+                            String idEscrito = pendingFixedWriteValue;
+
+                            // 🔹 Marcar en el Excel como "Registrado"
+                            dataBase.markItemAsRegistered(idEscrito, new DataBase.Callback() {
+                                @Override
+                                public void ok(String msg) {
+                                    runOnUiThread(() -> {
+                                        // puedes ajustar el texto como quieras
+                                        tvEstado.setText("Escritura OK. " + msg);
+                                        playSuccessBeep();
+                                    });
+                                }
+
+                                @Override
+                                public void fail(String err) {
+                                    runOnUiThread(() -> {
+                                        tvEstado.setText("Escritura OK, pero error al actualizar inventario: " + err);
+                                    });
+                                }
+                            });
 
                             if (afterWriteAskDescription) {
-                                // Pedir descripción y agregar al inventario
-                                String idEscrito = pendingFixedWriteValue; // capturar
-                                showInputDialog("Descripción para " + idEscrito, "", desc -> {
-                                    if (desc == null) desc = "";
-                                    dataBase.addItemToInventory(idEscrito, desc, new DataBase.Callback() {
-                                        @Override public void ok(String msg)  { runOnUiThread(() -> tvEstado.setText("Agregado al inventario. " + msg)); }
-                                        @Override public void fail(String err){ runOnUiThread(() -> tvEstado.setText("Error al agregar: " + err)); }
+                                String placaFija = idEscrito; // lo que se escribió en la tag, lo usamos como PLACA
+
+                                // 1) PERIDO
+                                showInputDialog("PERIDO", "", perido -> {
+                                    if (perido == null) perido = "";
+
+                                    // 2) MES
+                                    String finalPerido = perido;
+                                    showInputDialog("MES", "", mes -> {
+                                        if (mes == null) mes = "";
+
+                                        // 3) PLACA (prellenar con lo que se escribió en la tag)
+                                        String finalMes = mes;
+                                        showInputDialog("PLACA", placaFija, placa -> {
+                                            if (placa == null)
+                                                placa = placaFija; // si lo borran, usar la que venía del tag
+
+                                            // 4) SERIE
+                                            String finalPlaca = placa;
+                                            showInputDialog("SERIE", "", serie -> {
+                                                if (serie == null) serie = "";
+
+                                                // 5) IDENTIFICACION
+                                                String finalSerie = serie;
+                                                showInputDialog("IDENTIFICACION", "", identificacion -> {
+                                                    if (identificacion == null) identificacion = "";
+
+                                                    // 6) NOMBRE
+                                                    String finalIdentificacion = identificacion;
+                                                    showInputDialog("NOMBRE", "", nombre -> {
+                                                        if (nombre == null) nombre = "";
+
+                                                        // 7) ACTDESCRIPCION
+                                                        String finalNombre = nombre;
+                                                        showInputDialog("ACTDESCRIPCION", "", actDescripcion -> {
+                                                            if (actDescripcion == null)
+                                                                actDescripcion = "";
+
+                                                            // 8) CLASEDESCRIPCION
+                                                            String finalActDescripcion = actDescripcion;
+                                                            showInputDialog("CLASEDESCRIPCION", "", claseDescripcion -> {
+                                                                if (claseDescripcion == null)
+                                                                    claseDescripcion = "";
+
+                                                                // 9) UBICACION
+                                                                String finalClaseDescripcion = claseDescripcion;
+                                                                showInputDialog("UBICACION", "", ubicacion -> {
+                                                                    if (ubicacion == null)
+                                                                        ubicacion = "";
+
+                                                                    // 10) CODIGOCF
+                                                                    String finalUbicacion = ubicacion;
+                                                                    showInputDialog("CODIGOCF", "", codigoCf -> {
+                                                                        if (codigoCf == null)
+                                                                            codigoCf = "";
+
+                                                                        // 11) DESCRIPCIONCF
+                                                                        String finalCodigoCf = codigoCf;
+                                                                        showInputDialog("DESCRIPCIONCF", "", descripcionCf -> {
+                                                                            if (descripcionCf == null)
+                                                                                descripcionCf = "";
+
+                                                                            // Finalmente, agregamos al inventario
+                                                                            dataBase.addItemToInventory(
+                                                                                    finalPerido,
+                                                                                    finalMes,
+                                                                                    finalPlaca,
+                                                                                    finalSerie,
+                                                                                    finalIdentificacion,
+                                                                                    finalNombre,
+                                                                                    finalActDescripcion,
+                                                                                    finalClaseDescripcion,
+                                                                                    finalUbicacion,
+                                                                                    finalCodigoCf,
+                                                                                    descripcionCf,
+                                                                                    new DataBase.Callback() {
+                                                                                        @Override
+                                                                                        public void ok(String msg) {
+                                                                                            runOnUiThread(() -> {
+                                                                                                tvEstado.setText("Agregado al inventario. " + msg);
+                                                                                                playSuccessBeep();
+                                                                                            });
+                                                                                        }
+
+                                                                                        @Override
+                                                                                        public void fail(String err) {
+                                                                                            runOnUiThread(() ->
+                                                                                                    tvEstado.setText("Error al agregar: " + err)
+                                                                                            );
+                                                                                        }
+                                                                                    }
+                                                                            );
+                                                                        });
+                                                                    });
+                                                                });
+                                                            });
+                                                        });
+                                                    });
+                                                });
+                                            });
+                                        });
                                     });
                                 });
                             }
@@ -582,6 +771,7 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                             tvEstado.setText(out.userMessage);
                             android.util.Log.w("MIFARE_WRITE", out.technicalDetail);
                         }
+
                         // limpiar estado
                         pendingFixedWriteValue = null;
                         afterWriteAskDescription = false;
@@ -602,20 +792,21 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
     // --------------------------------------------------------------------------------------------
     // Diálogo de edición (UI)
     // --------------------------------------------------------------------------------------------
+
     /**
      * Entradas:
-     *   - prefill (String): valor inicial que aparecerá en el campo de texto (puede ser vacío).
-     *   - cb (ConfirmCallback): callback a invocar con el nuevo valor confirmado por el usuario.
+     * - prefill (String): valor inicial que aparecerá en el campo de texto (puede ser vacío).
+     * - cb (ConfirmCallback): callback a invocar con el nuevo valor confirmado por el usuario.
      * Salidas: Ninguna directa (el resultado se entrega vía callback).
      * Descripción: Muestra un diálogo con un EditText numérico para que el usuario modifique el
-     *              valor y lo confirme. Valida que no sea vacío antes de confirmar.
+     * valor y lo confirme. Valida que no sea vacío antes de confirmar.
      */
     private void showEditDialog(String prefill, ConfirmCallback cb) {
         // [Sección] Crear campo de entrada configurado para números
         final EditText input = new EditText(this);
         input.setHint("Número (ej. 88887777)");
         input.setInputType(InputType.TYPE_CLASS_NUMBER);
-        input.setFilters(new InputFilter[]{ new InputFilter.LengthFilter(32) });
+        input.setFilters(new InputFilter[]{new InputFilter.LengthFilter(32)});
         if (prefill != null) input.setText(prefill);
 
         // [Sección] Construir y mostrar el AlertDialog con acciones
@@ -651,5 +842,11 @@ public class MainActivity extends AppCompatActivity implements NfcAdapter.Reader
                 .setPositiveButton("OK", (d, w) -> onOk.accept(et.getText().toString()))
                 .setNegativeButton("Cancelar", null)
                 .show();
+    }
+
+
+    private void playSuccessBeep() {
+        ToneGenerator tg = new ToneGenerator(AudioManager.STREAM_MUSIC, 100);
+        tg.startTone(ToneGenerator.TONE_PROP_BEEP, 150); // 150 ms
     }
 }

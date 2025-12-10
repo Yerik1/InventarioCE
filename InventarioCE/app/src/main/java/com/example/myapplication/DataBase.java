@@ -38,7 +38,7 @@ public class DataBase {
     }
 
     public interface SelectCallback {
-        void onSelected(String id, String descripcion);
+        void onSelected(String PLACA, String DESCRIPCION);
         void onCancel(String reason);
     }
 
@@ -229,8 +229,8 @@ public class DataBase {
                 short max = header.getLastCellNum();
                 for (int c = min; c < max; c++) {
                     String name = cellToString(header.getCell(c)).trim().toLowerCase();
-                    if (name.equals("id")) colId = c;
-                    else if (name.equals("descripcion")) colDesc = c;
+                    if (name.equals("placa")) colId = c;
+                    else if (name.equals("ACTDESCRIPCIONn")) colDesc = c;
                 }
                 if (colId < 0 || colDesc < 0) {
                     logger.error("Encabezados 'id' y/o 'descripcion' no encontrados.");
@@ -370,37 +370,9 @@ public class DataBase {
             return;
         }
 
-        final String[] items = headers.toArray(new String[0]);
-        pickedIdCol = -1;
-        pickedDescCol = -1;
-
-        new AlertDialog.Builder(context)
-                .setTitle("Selecciona columna de ID")
-                .setSingleChoiceItems(items, -1, (dialog, which) -> pickedIdCol = which)
-                .setPositiveButton("Siguiente", (d, w) -> {
-                    if (pickedIdCol < 0) {
-                        logger.toast("Debes seleccionar la columna de ID.");
-                        return;
-                    }
-                    new AlertDialog.Builder(context)
-                            .setTitle("Selecciona columna de Descripción")
-                            .setSingleChoiceItems(items, -1, (dialog2, which2) -> pickedDescCol = which2)
-                            .setPositiveButton("Continuar", (d2, w2) -> {
-                                if (pickedDescCol < 0) {
-                                    logger.toast("Debes seleccionar la columna de Descripción.");
-                                    return;
-                                }
-                                if (pickedDescCol == pickedIdCol) {
-                                    logger.toast("ID y Descripción no pueden ser la misma columna.");
-                                    return;
-                                }
-                                exportFilteredXlsx();
-                            })
-                            .setNegativeButton("Cancelar", null)
-                            .show();
-                })
-                .setNegativeButton("Cancelar", null)
-                .show();
+        // Ya no mostramos diálogos: usamos TODAS las columnas del Excel origen.
+        logger.info("showPickColumnsDialog: usando todas las columnas, sin selección manual.");
+        exportFilteredXlsx();
     }
 
     private void exportFilteredXlsx() {
@@ -410,13 +382,19 @@ public class DataBase {
         }
         String time = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
         String suggestedName = "inventario_" + time + ".xlsx";
-        logger.info("Elige dónde guardar: " + suggestedName);
+        logger.info("exportFilteredXlsx: Elige dónde guardar: " + suggestedName);
         createXlsxLauncher.launch(suggestedName);
     }
 
     private void onCreateXlsxResult(Uri destUri) {
-        if (destUri == null) { logger.error("No se seleccionó destino para guardar."); return; }
-        if (sourceWb == null) { logger.error("No hay libro origen cargado."); return; }
+        if (destUri == null) {
+            logger.error("No se seleccionó destino para guardar.");
+            return;
+        }
+        if (sourceWb == null) {
+            logger.error("No hay libro origen cargado.");
+            return;
+        }
 
         // Ejecutar en segundo plano para evitar ANR/crash
         new Thread(() -> {
@@ -426,34 +404,85 @@ public class DataBase {
                 Workbook outWb = new XSSFWorkbook();
                 Sheet outSheet = outWb.createSheet("Inventario");
 
-                Row h = outSheet.createRow(0);
-                h.createCell(0).setCellValue("id");
-                h.createCell(1).setCellValue("descripcion");
-                h.createCell(2).setCellValue("estado");
-
                 Sheet inSheet = sourceWb.getSheetAt(0);
-                int outRowIdx = 1;
-
                 int first = inSheet.getFirstRowNum();
                 int last  = inSheet.getLastRowNum();
+
+                // === Fila de encabezados del archivo original ===
+                Row inHeader = inSheet.getRow(first);
+                if (inHeader == null) {
+                    logger.error("La hoja origen no tiene fila de encabezados.");
+                    outWb.close();
+                    return;
+                }
+
+                short lastCellNum = inHeader.getLastCellNum(); // puede ser -1
+                if (lastCellNum <= 0) {
+                    logger.error("La fila de encabezados no tiene celdas válidas.");
+                    outWb.close();
+                    return;
+                }
+
+                int colCount = lastCellNum; // columnas 0..colCount-1
+
+                // === Crear encabezado de salida ===
+                Row h = outSheet.createRow(0);
+                for (int c = 0; c < colCount; c++) {
+                    String headerName;
+                    try {
+                        headerName = cellToString(inHeader.getCell(c));
+                    } catch (Exception ex) {
+                        headerName = "";
+                    }
+                    h.createCell(c).setCellValue(headerName == null ? "" : headerName);
+                }
+
+                // Agregar columnas extra al final
+                int estadoColIdx     = colCount;
+                int registradoColIdx = colCount + 1;
+                h.createCell(estadoColIdx).setCellValue("estado");
+                h.createCell(registradoColIdx).setCellValue("registrado");
+
+                int outRowIdx = 1;
+
+                // === Copiar filas de datos ===
                 for (int r = first + 1; r <= last; r++) {
                     Row inRow = inSheet.getRow(r);
                     if (inRow == null) continue;
 
-                    String id  = cellToString(inRow.getCell(pickedIdCol));
-                    String des = cellToString(inRow.getCell(pickedDescCol));
-                    if ((id == null || id.isEmpty()) && (des == null || des.isEmpty())) continue;
-
                     Row outRow = outSheet.createRow(outRowIdx++);
-                    outRow.createCell(0).setCellValue(id == null ? "" : id);
-                    outRow.createCell(1).setCellValue(des == null ? "" : des);
-                    outRow.createCell(2).setCellValue("No encontrado");
+
+                    boolean allEmpty = true;
+
+                    // Copiar todas las columnas originales
+                    for (int c = 0; c < colCount; c++) {
+                        String v;
+                        try {
+                            v = cellToString(inRow.getCell(c));
+                        } catch (Exception ex) {
+                            v = "";
+                        }
+                        if (v == null) v = "";
+                        if (!v.isEmpty()) allEmpty = false;
+                        outRow.createCell(c).setCellValue(v);
+                    }
+
+                    // Si la fila está completamente vacía, la eliminamos
+                    if (allEmpty) {
+                        outSheet.removeRow(outRow);
+                        outRowIdx--;
+                        continue;
+                    }
+
+                    // Rellenar columnas nuevas
+                    outRow.createCell(estadoColIdx).setCellValue("No encontrado");
+                    outRow.createCell(registradoColIdx).setCellValue("No registrado"); // para llenar después
                 }
+
                 rowsExported = outRowIdx - 1;
 
-                outSheet.setColumnWidth(0, 20 * 256);
-                outSheet.setColumnWidth(1, 40 * 256);
-                outSheet.setColumnWidth(2, 18 * 256);
+                // ⚠ IMPORTANTE: NO usar autoSizeColumn en Android con Apache POI
+                // NADA de: outSheet.autoSizeColumn(...);
 
                 // Escribir al SAF
                 try (OutputStream os = context.getContentResolver().openOutputStream(destUri)) {
@@ -462,8 +491,6 @@ public class DataBase {
                     os.flush();
                 }
                 outWb.close();
-
-                // ⚠️ No usar renameDocument: puede dejar 0B con algunos providers
 
                 // Verificación post-escritura: consultar tamaño
                 long size = -1L;
@@ -486,7 +513,7 @@ public class DataBase {
                 headerNames = null;
                 pickedIdCol = -1;
                 pickedDescCol = -1;
-                setCurrentInventoryUri(destUri, true); // <- añade esta línea tras guardar OK
+                setCurrentInventoryUri(destUri, true);
             }
         }).start();
     }
@@ -548,8 +575,8 @@ public class DataBase {
             short max = header.getLastCellNum();
             for (int c = min; c < max; c++) {
                 String name = cellToString(header.getCell(c)).trim().toLowerCase();
-                if (name.equals("id")) colId = c;
-                else if (name.equals("descripcion")) colDesc = c;
+                if (name.equals("placa")) colId = c;
+                else if (name.equals("actdescripcion")) colDesc = c;
             }
             if (colId < 0 || colDesc < 0) {
                 logger.error("No se encontraron columnas 'id' y 'descripcion' en el encabezado.");
@@ -737,8 +764,8 @@ public class DataBase {
                 short min = header.getFirstCellNum(), max = header.getLastCellNum();
                 for (int c = min; c < max; c++) {
                     String name = cellToString(header.getCell(c)).trim().toLowerCase();
-                    if (name.equals("id")) colId = c;
-                    else if (name.equals("descripcion")) colDesc = c;
+                    if (name.equals("placa")) colId = c;
+                    else if (name.equals("actdescripcion")) colDesc = c;
                     else if (name.equals("estado")) colEstado = c;
                 }
                 // si no hay columna estado, la creamos al final
@@ -794,8 +821,8 @@ public class DataBase {
                 short min = header.getFirstCellNum(), max = header.getLastCellNum();
                 for (int c = min; c < max; c++) {
                     String name = cellToString(header.getCell(c)).trim().toLowerCase();
-                    if (name.equals("id")) colId = c;
-                    else if (name.equals("descripcion")) colDesc = c;
+                    if (name.equals("placa")) colId = c;
+                    else if (name.equals("actdescripcion")) colDesc = c;
                     else if (name.equals("estado")) colEstado = c;
                 }
                 if (colId < 0 || colDesc < 0) { if (cb != null) cb.fail("Faltan columnas 'id'/'descripcion'."); return; }
@@ -845,53 +872,178 @@ public class DataBase {
         }).start();
     }
 
-    public void addItemToInventory(String id, String descripcion, Callback cb) {
+    public void addItemToInventory(
+            String periodo,
+            String mes,
+            String placa,
+            String serie,
+            String identificacion,
+            String nombre,
+            String actDescripcion,
+            String claseDescripcion,
+            String ubicacion,
+            String codigoCf,
+            String descripcionCf,
+            Callback cb) {
+
         Uri uri = getCurrentInventoryUri();
-        if (uri == null) { if (cb != null) cb.fail("No hay inventario actual."); return; }
-        if (id == null || id.trim().isEmpty()) { if (cb != null) cb.fail("ID vacío."); return; }
+        if (uri == null) {
+            if (cb != null) cb.fail("No hay inventario actual.");
+            return;
+        }
 
         new Thread(() -> {
             Workbook wb = null;
             try (InputStream is = context.getContentResolver().openInputStream(uri)) {
                 wb = WorkbookFactory.create(is);
                 Sheet sheet = wb.getNumberOfSheets() > 0 ? wb.getSheetAt(0) : null;
-                if (sheet == null) { if (cb != null) cb.fail("El archivo no tiene hojas."); return; }
-
-                // localizar/crear headers
-                Row header = sheet.getRow(sheet.getFirstRowNum());
-                if (header == null) { header = sheet.createRow(0); }
-                int colId = -1, colDesc = -1, colEstado = -1;
-                short min = header.getFirstCellNum() == -1 ? 0 : header.getFirstCellNum();
-                short max = header.getLastCellNum()  == -1 ? 0 : header.getLastCellNum();
-
-                // Buscar por nombre; si faltan, crearlos al final
-                for (int c = min; c < max; c++) {
-                    String name = cellToString(header.getCell(c)).trim().toLowerCase();
-                    if (name.equals("id")) colId = c;
-                    else if (name.equals("descripcion")) colDesc = c;
-                    else if (name.equals("estado")) colEstado = c;
+                if (sheet == null) {
+                    if (cb != null) cb.fail("El archivo no tiene hojas.");
+                    return;
                 }
-                if (colId < 0)   { colId   = max++; header.createCell(colId).setCellValue("id"); }
-                if (colDesc < 0) { colDesc = max++; header.createCell(colDesc).setCellValue("descripcion"); }
-                if (colEstado < 0){ colEstado = max++; header.createCell(colEstado).setCellValue("estado"); }
 
-                int newRowIdx = sheet.getLastRowNum() + 1;
-                if (newRowIdx == 0) newRowIdx = 1; // por si no había filas
-                Row row = sheet.createRow(newRowIdx);
-                row.createCell(colId).setCellValue(id);
-                row.createCell(colDesc).setCellValue(descripcion == null ? "" : descripcion);
+                int firstRow = sheet.getFirstRowNum();
+                Row header = sheet.getRow(firstRow);
+                if (header == null) {
+                    header = sheet.createRow(firstRow);
+                }
+
+                // Buscar columnas existentes
+                int colPerido          = -1;
+                int colMes             = -1;
+                int colPlaca           = -1;
+                int colSerie           = -1;
+                int colIdentificacion  = -1;
+                int colNombre          = -1;
+                int colActDescripcion  = -1;
+                int colClaseDescripcion= -1;
+                int colUbicacion       = -1;
+                int colCodigoCf        = -1;
+                int colDescripcionCf   = -1;
+                int colEstado          = -1;
+                int colRegistrado      = -1;
+
+                short min = header.getFirstCellNum();
+                short max = header.getLastCellNum();
+                if (min < 0) min = 0;
+                if (max < 0) max = 0;
+                int nextCol = max;
+
+                for (int c = min; c < max; c++) {
+                    Cell hc = header.getCell(c);
+                    String name = hc == null ? "" : cellToString(hc);
+                    if (name == null) name = "";
+                    String lname = name.trim().toLowerCase();
+
+                    if (lname.equals("perido"))                 colPerido          = c;
+                    else if (lname.equals("mes"))               colMes             = c;
+                    else if (lname.equals("placa"))             colPlaca           = c;
+                    else if (lname.equals("serie"))             colSerie           = c;
+                    else if (lname.equals("identificacion"))    colIdentificacion  = c;
+                    else if (lname.equals("nombre"))            colNombre          = c;
+                    else if (lname.equals("actdescripcion"))    colActDescripcion  = c;
+                    else if (lname.equals("clasedescripcion"))  colClaseDescripcion= c;
+                    else if (lname.equals("ubicacion"))         colUbicacion       = c;
+                    else if (lname.equals("codigocf"))          colCodigoCf        = c;
+                    else if (lname.equals("descripcioncf"))     colDescripcionCf   = c;
+                    else if (lname.equals("estado"))            colEstado          = c;
+                    else if (lname.equals("registrado"))        colRegistrado      = c;
+                }
+
+                // Crear columnas que falten (con los encabezados EXACTOS del Excel)
+                if (colPerido < 0) {
+                    colPerido = nextCol++;
+                    header.createCell(colPerido).setCellValue("PERIDO");
+                }
+                if (colMes < 0) {
+                    colMes = nextCol++;
+                    header.createCell(colMes).setCellValue("MES");
+                }
+                if (colPlaca < 0) {
+                    colPlaca = nextCol++;
+                    header.createCell(colPlaca).setCellValue("PLACA");
+                }
+                if (colSerie < 0) {
+                    colSerie = nextCol++;
+                    header.createCell(colSerie).setCellValue("SERIE");
+                }
+                if (colIdentificacion < 0) {
+                    colIdentificacion = nextCol++;
+                    header.createCell(colIdentificacion).setCellValue("IDENTIFICACION");
+                }
+                if (colNombre < 0) {
+                    colNombre = nextCol++;
+                    header.createCell(colNombre).setCellValue("NOMBRE");
+                }
+                if (colActDescripcion < 0) {
+                    colActDescripcion = nextCol++;
+                    header.createCell(colActDescripcion).setCellValue("ACTDESCRIPCION");
+                }
+                if (colClaseDescripcion < 0) {
+                    colClaseDescripcion = nextCol++;
+                    header.createCell(colClaseDescripcion).setCellValue("CLASEDESCRIPCION");
+                }
+                if (colUbicacion < 0) {
+                    colUbicacion = nextCol++;
+                    header.createCell(colUbicacion).setCellValue("UBICACION");
+                }
+                if (colCodigoCf < 0) {
+                    colCodigoCf = nextCol++;
+                    header.createCell(colCodigoCf).setCellValue("CODIGOCF");
+                }
+                if (colDescripcionCf < 0) {
+                    colDescripcionCf = nextCol++;
+                    header.createCell(colDescripcionCf).setCellValue("DESCRIPCIONCF");
+                }
+                if (colEstado < 0) {
+                    colEstado = nextCol++;
+                    header.createCell(colEstado).setCellValue("estado");
+                }
+                if (colRegistrado < 0) {
+                    colRegistrado = nextCol++;
+                    header.createCell(colRegistrado).setCellValue("registrado");
+                }
+
+                // Crear nueva fila al final
+                int lastRow = sheet.getLastRowNum();
+                int newRowIndex = lastRow + 1;
+                Row row = sheet.getRow(newRowIndex);
+                if (row == null) {
+                    row = sheet.createRow(newRowIndex);
+                }
+
+                // Escribir valores recibidos
+                row.createCell(colPerido).setCellValue(periodo == null ? "" : periodo);
+                row.createCell(colMes).setCellValue(mes == null ? "" : mes);
+                row.createCell(colPlaca).setCellValue(placa == null ? "" : placa);
+                row.createCell(colSerie).setCellValue(serie == null ? "" : serie);
+                row.createCell(colIdentificacion).setCellValue(identificacion == null ? "" : identificacion);
+                row.createCell(colNombre).setCellValue(nombre == null ? "" : nombre);
+                row.createCell(colActDescripcion).setCellValue(actDescripcion == null ? "" : actDescripcion);
+                row.createCell(colClaseDescripcion).setCellValue(claseDescripcion == null ? "" : claseDescripcion);
+                row.createCell(colUbicacion).setCellValue(ubicacion == null ? "" : ubicacion);
+                row.createCell(colCodigoCf).setCellValue(codigoCf == null ? "" : codigoCf);
+                row.createCell(colDescripcionCf).setCellValue(descripcionCf == null ? "" : descripcionCf);
+
+                // Valores por defecto para estado / registrado
                 row.createCell(colEstado).setCellValue("No encontrado");
+                row.createCell(colRegistrado).setCellValue("No registrado");
 
-                try (OutputStream os = context.getContentResolver().openOutputStream(uri)) {
-                    if (os == null) throw new IllegalStateException("OutputStream nulo.");
+                // Guardar cambios en el mismo archivo
+                try (OutputStream os = context.getContentResolver().openOutputStream(uri, "rwt")) {
+                    if (os == null) {
+                        throw new IllegalStateException("OutputStream nulo para URI destino.");
+                    }
                     wb.write(os);
                     os.flush();
                 }
-                wb.close();
-                if (cb != null) cb.ok("ID " + id + " agregado.");
+
+                if (cb != null) cb.ok("Ítem agregado al inventario.");
+
             } catch (Exception e) {
+                if (cb != null) cb.fail("Error al agregar al inventario: " + e.getMessage());
+            } finally {
                 try { if (wb != null) wb.close(); } catch (Exception ignore) {}
-                if (cb != null) cb.fail("Error al agregar: " + e.getMessage());
             }
         }).start();
     }
@@ -910,41 +1062,64 @@ public class DataBase {
                 Row header = sheet.getRow(sheet.getFirstRowNum());
                 if (header == null) { cb.onCancel("No se encontró encabezado."); return; }
 
-                int colId = -1, colDesc = -1;
+                int colId = -1, colDesc = -1, colReg = -1;
                 short min = header.getFirstCellNum(), max = header.getLastCellNum();
                 for (int c = min; c < max; c++) {
-                    String name = cellToString(header.getCell(c)).trim().toLowerCase();
-                    if (name.equals("id")) colId = c;
-                    else if (name.equals("descripcion")) colDesc = c;
+                    String name = cellToString(header.getCell(c));
+                    if (name == null) name = "";
+                    name = name.trim().toLowerCase();
+                    if (name.equals("placa")) colId = c;
+                    else if (name.equals("actdescripcion")) colDesc = c;
+                    else if (name.equals("registrado")) colReg = c;
                 }
                 if (colId < 0 || colDesc < 0) { cb.onCancel("Faltan columnas 'id'/'descripcion'."); return; }
+                if (colReg < 0) { cb.onCancel("Falta columna 'registrado'."); return; }
 
                 List<String> labels = new ArrayList<>();
-                List<String> ids = new ArrayList<>();
-                List<String> descs = new ArrayList<>();
+                List<String> ids    = new ArrayList<>();
+                List<String> descs  = new ArrayList<>();
 
                 int first = sheet.getFirstRowNum(), last = sheet.getLastRowNum();
                 for (int r = first + 1; r <= last; r++) {
                     Row row = sheet.getRow(r);
                     if (row == null) continue;
+
                     String id  = cellToString(row.getCell(colId));
                     String ds  = cellToString(row.getCell(colDesc));
-                    if (id == null || id.isEmpty()) continue;
-                    labels.add(id + " – " + (ds == null ? "" : ds));
+                    String reg = cellToString(row.getCell(colReg));
+
+                    if (id == null) id = "";
+                    if (ds == null) ds = "";
+                    if (reg == null) reg = "";
+
+                    // Solo mostrar "No registrado"
+                    if (!reg.trim().equalsIgnoreCase("no registrado")) continue;
+                    if (id.isEmpty()) continue;
+
+                    labels.add(id + " – " + ds);
                     ids.add(id);
-                    descs.add(ds == null ? "" : ds);
+                    descs.add(ds);
                 }
-                Workbook finalWb = wb; // para cerrar luego
+
+                Workbook finalWb = wb;
                 new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
-                    if (labels.isEmpty()) { cb.onCancel("No hay elementos en inventario."); try{finalWb.close();}catch(Exception ignore){} return; }
+                    if (labels.isEmpty()) {
+                        cb.onCancel("No hay elementos 'No registrado' en inventario.");
+                        try { finalWb.close(); } catch (Exception ignore) {}
+                        return;
+                    }
 
                     final int[] pick = {-1};
                     new AlertDialog.Builder(context)
-                            .setTitle("Selecciona ID")
-                            .setSingleChoiceItems(labels.toArray(new String[0]), -1, (d, w) -> pick[0] = w)
+                            .setTitle("Selecciona ID (No registrado)")
+                            .setSingleChoiceItems(labels.toArray(new String[0]), -1,
+                                    (d, w) -> pick[0] = w)
                             .setPositiveButton("Usar", (d, w) -> {
-                                if (pick[0] < 0) { cb.onCancel("No se seleccionó ID."); }
-                                else { cb.onSelected(ids.get(pick[0]), descs.get(pick[0])); }
+                                if (pick[0] < 0) {
+                                    cb.onCancel("No se seleccionó ID.");
+                                } else {
+                                    cb.onSelected(ids.get(pick[0]), descs.get(pick[0]));
+                                }
                                 try { finalWb.close(); } catch (Exception ignore) {}
                             })
                             .setNegativeButton("Cancelar", (d, w) -> {
@@ -956,6 +1131,87 @@ public class DataBase {
             } catch (Exception e) {
                 try { if (wb != null) wb.close(); } catch (Exception ignore) {}
                 cb.onCancel("Error abriendo inventario: " + e.getMessage());
+            }
+        }).start();
+    }
+
+    public void markItemAsRegistered(String targetId, Callback cb) {
+        Uri uri = getCurrentInventoryUri();
+        if (uri == null) {
+            if (cb != null) cb.fail("No hay inventario actual.");
+            return;
+        }
+
+        new Thread(() -> {
+            Workbook wb = null;
+            try (InputStream is = context.getContentResolver().openInputStream(uri)) {
+                wb = WorkbookFactory.create(is);
+                Sheet sheet = wb.getNumberOfSheets() > 0 ? wb.getSheetAt(0) : null;
+                if (sheet == null) {
+                    if (cb != null) cb.fail("El archivo no tiene hojas.");
+                    return;
+                }
+
+                Row header = sheet.getRow(sheet.getFirstRowNum());
+                if (header == null) {
+                    if (cb != null) cb.fail("No se encontró encabezado.");
+                    return;
+                }
+
+                int colId = -1, colReg = -1;
+                short min = header.getFirstCellNum(), max = header.getLastCellNum();
+                for (int c = min; c < max; c++) {
+                    String name = cellToString(header.getCell(c));
+                    if (name == null) name = "";
+                    name = name.trim().toLowerCase();
+                    if (name.equals("placa")) colId = c;
+                    else if (name.equals("registrado")) colReg = c;
+                }
+                if (colId < 0) {
+                    if (cb != null) cb.fail("Falta columna 'id'.");
+                    return;
+                }
+                if (colReg < 0) {
+                    if (cb != null) cb.fail("Falta columna 'registrado'.");
+                    return;
+                }
+
+                boolean found = false;
+                int first = sheet.getFirstRowNum(), last = sheet.getLastRowNum();
+                for (int r = first + 1; r <= last; r++) {
+                    Row row = sheet.getRow(r);
+                    if (row == null) continue;
+
+                    String id = cellToString(row.getCell(colId));
+                    if (id == null) id = "";
+                    if (id.trim().equals(targetId.trim())) {
+                        Cell regCell = row.getCell(colReg);
+                        if (regCell == null) regCell = row.createCell(colReg);
+                        regCell.setCellValue("Registrado");
+                        found = true;
+                        break;
+                    }
+                }
+
+                if (!found) {
+                    if (cb != null) cb.fail("No se encontró el ID en el inventario.");
+                    return;
+                }
+
+                // Guardar cambios en el mismo archivo
+                try (OutputStream os = context.getContentResolver()
+                        .openOutputStream(uri, "rwt")) {
+                    if (os == null) throw new IllegalStateException("OutputStream nulo para URI destino.");
+                    wb.write(os);
+                    os.flush();
+                }
+
+                if (cb != null) cb.ok("Estado actualizado a 'Registrado' para ID " + targetId);
+
+            } catch (Exception e) {
+                if (cb != null) cb.fail("Error actualizando inventario: " + e.getMessage());
+            } finally {
+                try { if (wb != null) wb.close(); } catch (Exception ignore) {}
             }
         }).start();
     }
